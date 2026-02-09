@@ -350,11 +350,24 @@ CUDA VERSIONS
 
 '''
 
+def lanczos_kernel_gpu(x: torch.Tensor, a: float = 4.0) -> torch.Tensor:
+	"""Lanczos kernel with support width a."""
+	return torch.where(
+		torch.abs(x) < 1e-10,
+		torch.ones_like(x),
+		torch.where(
+			torch.abs(x) < a,
+			a * torch.sin(torch.pi * x) * torch.sin(torch.pi * x / a) / (torch.pi * x * torch.pi * x / a),
+			torch.zeros_like(x)
+		)
+	)
+
+
 def sample_and_reconstruct_zone_plate_tiled_gpu(
     zone_plate: np.ndarray,
     tile_points: np.ndarray,
     tile_size: int = 64,
-    kernel_radius: float = 2.0,
+    kernel_radius: float = 4.0,
     device: str = 'cuda',
     batch_size: int = 64
 ) -> np.ndarray:
@@ -364,11 +377,11 @@ def sample_and_reconstruct_zone_plate_tiled_gpu(
 
 	height, width = zone_plate.shape
 
-	# Convert inputs to torch tensors
 	zone_plate_torch = torch.from_numpy(zone_plate).float().to(device)
 	tile_points_torch = torch.from_numpy(tile_points).float().to(device)
 
 	# Tile the points across the entire image
+	# Points are toroidal so simple tiling produces seamless boundaries
 	all_points = []
 
 	for ty in range(0, height, tile_size):
@@ -376,197 +389,60 @@ def sample_and_reconstruct_zone_plate_tiled_gpu(
 			offset_points = tile_points_torch.clone()
 			offset_points[:, 0] += tx
 			offset_points[:, 1] += ty
-			
-			# Clip to image bounds
+
 			valid = (offset_points[:, 0] < width) & (offset_points[:, 1] < height)
 			offset_points = offset_points[valid]
-			
+
 			all_points.append(offset_points)
 
-	all_points = torch.cat(all_points, dim = 0)  # Shape: (N, 2) where N is total number of points
+	all_points = torch.cat(all_points, dim=0)
 
 	sample_y = all_points[:, 1].long().clamp(0, height - 1)
 	sample_x = all_points[:, 0].long().clamp(0, width - 1)
-	sampled_values = zone_plate_torch[sample_y, sample_x]  # Shape: (N,)
+	sampled_values = zone_plate_torch[sample_y, sample_x]
 
 	reconstructed = torch.zeros((height, width), device=device)
-	kernel_const = -1.0 / (2 * kernel_radius**2)
 
 	for start_row in range(0, height, batch_size):
 		end_row = min(start_row + batch_size, height)
 		num_rows = end_row - start_row
-		
+
 		y_grid = torch.arange(start_row, end_row, device=device)[:, None].expand(num_rows, width)
 		x_grid = torch.arange(width, device=device)[None, :].expand(num_rows, width)
-		pixel_positions = torch.stack([x_grid, y_grid], dim = 2)  
+		pixel_positions = torch.stack([x_grid, y_grid], dim=2)
 
-		pixel_positions = pixel_positions.reshape(num_rows * width, 1, 2)  # Shape: (num_rows * width, 1, 2)
-		all_points_broadcast = all_points[None, :, :]  # Shape: (1, N, 2)
-		
-		distances_sq = ((pixel_positions - all_points_broadcast) ** 2).sum(dim = 2)
-		
-		weights = torch.exp(distances_sq * kernel_const)  # Shape: (num_rows*width, N)
-		
-		weight_sum = weights.sum(dim=1, keepdim=True)  # Shape: (num_rows*width, 1)
-		weighted_values = (weights * sampled_values[None, :]).sum(dim=1)  # Shape: (num_rows*width,)
-		
-		# Avoid division by zero
+		pixel_positions = pixel_positions.reshape(num_rows * width, 1, 2)
+		all_points_broadcast = all_points[None, :, :]
+
+		diff = pixel_positions - all_points_broadcast
+		dx = diff[:, :, 0]
+		dy = diff[:, :, 1]
+
+		distances_sq = dx ** 2 + dy ** 2
+		kernel_const = -1.0 / (2.0 * kernel_radius ** 2)
+		weights = torch.exp(distances_sq * kernel_const)
+
+		weight_sum = weights.sum(dim=1, keepdim=True)
+		weighted_values = (weights * sampled_values[None, :]).sum(dim=1)
+
 		result = torch.where(
 			weight_sum.squeeze() > 1e-10,
 			weighted_values / weight_sum.squeeze(),
 			torch.tensor(0.5, device=device)
 		)
-		
+
 		reconstructed[start_row:end_row, :] = result.reshape(num_rows, width)
 
 	return reconstructed.cpu().numpy()
 
 
-def sample_and_reconstruct_zone_plate_tiled_optimized(
-    zone_plate: np.ndarray,
-    tile_points: np.ndarray,
-    tile_size: int = 64,
-    kernel_radius: float = 2.0,
-    device: str = 'cuda',
-    cutoff_radius: Optional[float] = None
-) -> np.ndarray:
-	if device == 'cuda' and not torch.cuda.is_available():
-		print("CUDA not available, falling back to CPU")
-		device = 'cpu'
-
-	if cutoff_radius is None:
-		cutoff_radius = 3 * kernel_radius
-
-	height, width = zone_plate.shape
-
-	# Convert inputs to torch tensors
-	zone_plate_torch = torch.from_numpy(zone_plate).float().to(device)
-	tile_points_torch = torch.from_numpy(tile_points).float().to(device)
-
-	# Tile the points across the entire image
-	all_points = []
-
-	for ty in range(0, height, tile_size):
-		for tx in range(0, width, tile_size):
-			offset_points = tile_points_torch.clone()
-			offset_points[:, 0] += tx
-			offset_points[:, 1] += ty
-			
-			valid = (offset_points[:, 0] < width) & (offset_points[:, 1] < height)
-			offset_points = offset_points[valid]
-			
-			all_points.append(offset_points)
-
-	all_points = torch.cat(all_points, dim=0)
-
-	# Sample values
-	sample_y = all_points[:, 1].long().clamp(0, height - 1)
-	sample_x = all_points[:, 0].long().clamp(0, width - 1)
-	sampled_values = zone_plate_torch[sample_y, sample_x]
-
-	# Reconstruct with spatial cutoff
-	reconstructed = torch.zeros((height, width), device=device)
-	kernel_const = -1.0 / (2 * kernel_radius**2)
-	cutoff_radius_sq = cutoff_radius ** 2
-
-	# Process each pixel
-	for i in range(height):
-		for j in range(width):
-			pixel_pos = torch.tensor([j, i], dtype=torch.float32, device=device)
-			
-			distances_sq = ((all_points - pixel_pos) ** 2).sum(dim=1)
-			nearby_mask = distances_sq < cutoff_radius_sq
-			
-			if nearby_mask.any():
-				nearby_distances_sq = distances_sq[nearby_mask]
-				nearby_values = sampled_values[nearby_mask]
-				
-				weights = torch.exp(nearby_distances_sq * kernel_const)
-				weight_sum = weights.sum()
-				
-				if weight_sum > 1e-10:
-					reconstructed[i, j] = (weights * nearby_values).sum() / weight_sum
-				else:
-					reconstructed[i, j] = 0.5
-			else:
-				reconstructed[i, j] = 0.5
-
-	return reconstructed.cpu().numpy()
-
-
-def sample_and_reconstruct_zone_plate_tiled_fastest(
-    zone_plate: np.ndarray,
-    tile_points: np.ndarray,
-    tile_size: int = 64,
-    kernel_radius: float = 2.0,
-    device: str = 'cuda'
-) -> np.ndarray:
-
-	if device == 'cuda' and not torch.cuda.is_available():
-		print("CUDA not available, falling back to CPU")
-		device = 'cpu'
-
-	height, width = zone_plate.shape
-
-	# Convert inputs to torch tensors
-	zone_plate_torch = torch.from_numpy(zone_plate).float().to(device)
-	tile_points_torch = torch.from_numpy(tile_points).float().to(device)
-
-	# Tile the points
-	all_points = []
-	for ty in range(0, height, tile_size):
-		for tx in range(0, width, tile_size):
-			offset_points = tile_points_torch.clone()
-			offset_points[:, 0] += tx
-			offset_points[:, 1] += ty
-			
-			valid = (offset_points[:, 0] < width) & (offset_points[:, 1] < height)
-			all_points.append(offset_points[valid])
-
-	all_points = torch.cat(all_points, dim=0)  # Shape: (N, 2)
-
-	sample_y = all_points[:, 1].long().clamp(0, height - 1)
-	sample_x = all_points[:, 0].long().clamp(0, width - 1)
-	sampled_values = zone_plate_torch[sample_y, sample_x]  # Shape: (N,)
-
-	y_coords, x_coords = torch.meshgrid(
-		torch.arange(height, device=device),
-		torch.arange(width, device=device),
-		indexing='ij'
-	)
-	pixel_positions = torch.stack([x_coords, y_coords], dim=2)  # Shape: (H, W, 2)
-
-	pixel_positions = pixel_positions.reshape(height * width, 1, 2)  # (H*W, 1, 2)
-	all_points_broadcast = all_points[None, :, :]  # (1, N, 2)
-
-	distances_sq = ((pixel_positions - all_points_broadcast) ** 2).sum(dim=2)  # (H*W, N)
-
-	kernel_const = -1.0 / (2 * kernel_radius**2)
-	weights = torch.exp(distances_sq * kernel_const)  # (H*W, N)
-
-	weight_sum = weights.sum(dim=1, keepdim=True)  # (H*W, 1)
-	weighted_values = (weights * sampled_values[None, :]).sum(dim=1)  # (H*W,)
-
-	result = torch.where(
-		weight_sum.squeeze() > 1e-10,
-		weighted_values / weight_sum.squeeze(),
-		torch.tensor(0.5, device=device)
-	)
-
-	reconstructed = result.reshape(height, width)
-
-	return reconstructed.cpu().numpy()
-
-
-def visualize_sampling_analysis_gpu(points, domain_size = (256, 256), zone_plate_alpha = np.pi * 64.0, 
-                                kernel_radius = 1.5, device = 'cuda', batch_size = 64):
-	# Convert torch tensor to numpy if needed
+def visualize_sampling_analysis_gpu(points, domain_size=(256, 256), zone_plate_alpha=np.pi * 64.0,
+                                kernel_radius=4.0, device='cuda', batch_size=64, tile_size=64):
 	if isinstance(points, torch.Tensor):
 		points_np = points.cpu().numpy()
 	else:
 		points_np = points
 
-	# Check device availability
 	if device == 'cuda' and not torch.cuda.is_available():
 		print("CUDA not available, falling back to CPU")
 		device = 'cpu'
@@ -589,11 +465,11 @@ def visualize_sampling_analysis_gpu(points, domain_size = (256, 256), zone_plate
 	axes[1].set_title(f'Original Zone Plate\n(alpha = {zone_plate_alpha:.2f})')
 	axes[1].axis('off')
 
-	# Right-Middle: Reconstructed sampled zone plate (GPU accelerated!)
+	# Right-Middle: Reconstructed sampled zone plate
 	reconstructed_zone = sample_and_reconstruct_zone_plate_tiled_gpu(
-		zone_plate, 
-		points_np, 
-		tile_size=64, 
+		zone_plate,
+		points_np,
+		tile_size=tile_size,
 		kernel_radius=kernel_radius,
 		device=device,
 		batch_size=batch_size
@@ -608,7 +484,7 @@ def visualize_sampling_analysis_gpu(points, domain_size = (256, 256), zone_plate
 	freqs_1d, power_1d = compute_1d_power_spectrum(points_np, max_dim)
 	power_2d, extent = compute_2d_power_spectrum(points_np, max_dim, grid_size=256)
 
-	P = power_2d / np.nanmean(power_2d)  # normalize
+	P = power_2d / np.nanmean(power_2d)
 
 	# Ignore DC
 	c = P.shape[0] // 2
