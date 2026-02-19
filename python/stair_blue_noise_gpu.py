@@ -237,12 +237,12 @@ def synthesize_stair_blue_noise_gpu(
 		device = 'cpu'
 
 	rng = np.random.default_rng(seed)
-	w, h = region_size
-	V: float = w * h
+	(width, height) = region_size
+	V: float = width * height
 	rho: float = N / V
 
 	# Initialize random point set
-	points_np = rng.uniform(0, 1, size=(N, 2)).astype(np.float32) * np.array([w, h], dtype=np.float32)
+	points_np = rng.uniform(0, 1, size=(N, 2)).astype(np.float32) * np.array([width, height], dtype=np.float32)
 	points = torch.from_numpy(points_np).to(device)
 
 	# Discretize radius
@@ -250,7 +250,7 @@ def synthesize_stair_blue_noise_gpu(
 	r_vals = torch.from_numpy(r_vals_np).to(device)
 	M: int = len(r_vals)
 
-	# Target PCF (computed on CPU, transferred to GPU)
+	# Target PCF
 	G_star_np = stair_pcf_closed_gpu(r_vals_np, k0, k1, P0, rho).astype(np.float32)
 	G_star = torch.from_numpy(G_star_np).to(device)
 
@@ -262,8 +262,8 @@ def synthesize_stair_blue_noise_gpu(
 	for iteration in range(num_iterations):
 		# Toroidal pairwise differences and distances
 		diff = points.unsqueeze(1) - points.unsqueeze(0)  # (N, N, 2)
-		diff[:, :, 0] = diff[:, :, 0] - w * torch.round(diff[:, :, 0] / w)
-		diff[:, :, 1] = diff[:, :, 1] - h * torch.round(diff[:, :, 1] / h)
+		diff[:, :, 0] = diff[:, :, 0] - width * torch.round(diff[:, :, 0] / width)
+		diff[:, :, 1] = diff[:, :, 1] - height * torch.round(diff[:, :, 1] / height)
 		dists = torch.sqrt((diff ** 2).sum(dim=2))  # (N, N)
 
 		# Estimate current PCF
@@ -292,11 +292,11 @@ def synthesize_stair_blue_noise_gpu(
 		points = points - step_size * normalized_grad
 
 		# Wrap to region (toroidal)
-		points[:, 0] = torch.fmod(points[:, 0], w)
-		points[:, 1] = torch.fmod(points[:, 1], h)
+		points[:, 0] = torch.fmod(points[:, 0], width)
+		points[:, 1] = torch.fmod(points[:, 1], height)
 		# fmod can return negative values, fix that
-		points[:, 0] = torch.where(points[:, 0] < 0, points[:, 0] + w, points[:, 0])
-		points[:, 1] = torch.where(points[:, 1] < 0, points[:, 1] + h, points[:, 1])
+		points[:, 0] = torch.where(points[:, 0] < 0, points[:, 0] + width, points[:, 0])
+		points[:, 1] = torch.where(points[:, 1] < 0, points[:, 1] + height, points[:, 1])
 
 	return points.cpu().numpy(), errors
 
