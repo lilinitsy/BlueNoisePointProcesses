@@ -308,9 +308,9 @@ def estimate_pcf_vectorized_gpu(
 	region_size: Tuple[float, float] = (1.0, 1.0),
 ) -> NDArray[np.float32]:
 	N: int = points.shape[0]
-	w, h = region_size
-	V_W: float = w * h
-	S_W: float = 2.0 * (w + h)
+	width, height = region_size
+	V_W: float = width * height
+	S_W: float = 2.0 * (width + height)
 
 	diff = points[:, np.newaxis, :] - points[np.newaxis, :, :]
 	dists = np.sqrt(np.sum(diff ** 2, axis=2))
