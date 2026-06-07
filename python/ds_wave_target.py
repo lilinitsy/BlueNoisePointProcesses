@@ -33,6 +33,9 @@ def make_hankel_matrix(nu: np.ndarray, r: np.ndarray) -> np.ndarray:
 	"""
 	nu_weights = trapezoid_weights(nu) * nu
 	phase = 2.0 * math.pi * np.outer(r, nu)
+
+	# Entries look like: H[r_i, nu_j] = 2 pi * J0(2 pi r_i nu_j) * nu_j * delta_{nu_j}
+
 	return 2.0 * math.pi * j0(phase) * nu_weights[None, :]
 
 def empty_target(
@@ -221,9 +224,13 @@ def solve_ds_wave_target(
 			raise RuntimeError(f"DS-Wave target solve {status}: {result.message}")
 		return target
 
+
+	# This computes the PCF
 	F = result.x[:n_f_values]
 	P = F + 1.0
 	g = H @ F + 1.0
+
+
 	return {
 		"success": True,
 		"status": "optimal",
