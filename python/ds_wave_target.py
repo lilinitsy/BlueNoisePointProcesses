@@ -249,6 +249,48 @@ def solve_ds_wave_target(
 		"linprog_result": result,
 	}
 
+def solve_ds_wave_target_for_targetrdf(
+	n_points: int,
+	nu0: float = 0.85,
+	e0: float = 0.0,
+	m0: float | str | None = None,
+	nu_max: float = 10.0,
+	n_nu: int = 1001,
+	r_max: float | None = None,
+	n_r: int | None = None,
+	r_samples_per_unit: float = 32.0,
+	tail_anchor_count: int = 1,
+	m0_tol: float = 0.02,
+	max_m0: float = 64.0,
+	require_success: bool = True,
+) -> dict:
+	"""Solve a DS-Wave target over the full TargetRDF distance domain."""
+	if n_points < 2:
+		raise ValueError("n_points must be at least 2")
+	if r_samples_per_unit <= 0.0:
+		raise ValueError("r_samples_per_unit must be positive")
+
+	if r_max is None:
+		r_max = 0.5 * math.sqrt(float(n_points))
+	if r_max <= 0.0:
+		raise ValueError("r_max must be positive")
+	if n_r is None:
+		n_r = max(2, int(math.ceil(r_samples_per_unit * r_max)))
+
+	return solve_ds_wave_target(
+		nu0=nu0,
+		e0=e0,
+		m0=m0,
+		nu_max=nu_max,
+		n_nu=n_nu,
+		r_max=r_max,
+		n_r=n_r,
+		tail_anchor_count=tail_anchor_count,
+		m0_tol=m0_tol,
+		max_m0=max_m0,
+		require_success=require_success,
+	)
+
 def find_min_m0(
 	nu0: float = 0.85,
 	e0: float = 0.0,
@@ -333,7 +375,13 @@ def interpolate_target_power(target: dict, radii: np.ndarray) -> np.ndarray:
 	"""Interpolate solved target power P(nu) at normalized frequency radii."""
 	if target["P"] is None:
 		raise ValueError("target has no solved power spectrum")
-	return np.interp(radii, target["nu"], target["P"], left=target["P"][0], right=target["P"][-1])
+	powers = np.interp(radii, target["nu"], target["P"], left=target["P"][0], right=target["P"][-1])
+	nu0 = target.get("nu0")
+	e0 = target.get("e0")
+	if nu0 is not None and e0 is not None:
+		radii_array = np.asarray(radii, dtype=np.float64)
+		powers = np.where(radii_array < float(nu0), np.minimum(powers, float(e0)), powers)
+	return powers
 
 def evaluate_target_pcf(target: dict, radii: np.ndarray) -> np.ndarray:
 	"""Evaluate g(r) directly from F on arbitrary normalized distance radii.

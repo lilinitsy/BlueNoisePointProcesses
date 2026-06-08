@@ -72,6 +72,109 @@ def compute_radial_psd(
 		radial[:] = 0.0
 	return centres, radial
 
+def compute_low_frequency_mode_powers(
+	points: np.ndarray,
+	nu_max: float,
+	mode_limit: int = 0,
+	seed: int = 0,
+) -> dict:
+	"""Return exact low-frequency Fourier powers sorted from largest to smallest.
+
+	This diagnostic checks whether the low-frequency hole is genuinely leaking,
+	instead of relying on a downsampled periodogram image.
+	"""
+	points = np.asarray(points, dtype=np.float64)
+	if points.ndim != 2 or points.shape[0] < 1:
+		raise ValueError("points must have shape (n_points, n_dims) with at least one point")
+	if nu_max <= 0.0:
+		raise ValueError("nu_max must be positive")
+
+	modes = make_frequency_modes(points.shape[0], nu_max=nu_max, mode_limit=mode_limit, seed=seed)
+	if modes.shape[0] == 0:
+		raise ValueError("no Fourier modes available for the requested n_points and nu_max")
+	radii = np.linalg.norm(modes, axis=1) / math.sqrt(float(points.shape[0]))
+	powers = direct_mode_power(points, modes)
+	order = np.argsort(powers)[::-1]
+	modes = modes[order]
+	radii = radii[order]
+	powers = powers[order]
+	return {
+		"modes": modes,
+		"radii": radii,
+		"powers": powers,
+		"mean_power": float(np.mean(powers)),
+		"median_power": float(np.median(powers)),
+		"max_power": float(np.max(powers)),
+		"mode_count": int(modes.shape[0]),
+	}
+
+def compute_target_mode_powers(
+	target: dict,
+	n_points: int,
+	nu_max: float,
+	mode_limit: int = 0,
+	seed: int = 0,
+) -> dict:
+	"""Return target powers at exact integer Fourier mode radii below nu_max."""
+	if n_points < 1:
+		raise ValueError("n_points must be at least 1")
+	if nu_max <= 0.0:
+		raise ValueError("nu_max must be positive")
+
+	modes = make_frequency_modes(n_points, nu_max=nu_max, mode_limit=mode_limit, seed=seed)
+	if modes.shape[0] == 0:
+		raise ValueError("no Fourier modes available for the requested n_points and nu_max")
+	radii = np.linalg.norm(modes, axis=1) / math.sqrt(float(n_points))
+	mask = radii < nu_max
+	modes = modes[mask]
+	radii = radii[mask]
+	if modes.shape[0] == 0:
+		raise ValueError("no Fourier modes below the requested nu_max")
+
+	powers = interpolate_target_power(target, radii)
+	order = np.argsort(powers)[::-1]
+	modes = modes[order]
+	radii = radii[order]
+	powers = powers[order]
+	return {
+		"modes": modes,
+		"radii": radii,
+		"powers": powers,
+		"mean_power": float(np.mean(powers)),
+		"median_power": float(np.median(powers)),
+		"max_power": float(np.max(powers)),
+		"mode_count": int(modes.shape[0]),
+	}
+
+def summarise_mode_power_bands(report: dict, bands: list[tuple[float, float]]) -> list[dict]:
+	"""Summarise mode-power diagnostics over radial frequency bands."""
+	radii = np.asarray(report["radii"], dtype=np.float64)
+	powers = np.asarray(report["powers"], dtype=np.float64)
+	if radii.shape != powers.shape:
+		raise ValueError("report radii and powers must have the same shape")
+
+	summaries = []
+	for low, high in bands:
+		if high <= low:
+			raise ValueError("band high value must be greater than low value")
+		mask = (radii >= low) & (radii < high)
+		if np.any(mask):
+			mean_power = float(np.mean(powers[mask]))
+			median_power = float(np.median(powers[mask]))
+			max_power = float(np.max(powers[mask]))
+		else:
+			mean_power = 0.0
+			median_power = 0.0
+			max_power = 0.0
+		summaries.append({
+			"range": (float(low), float(high)),
+			"count": int(np.sum(mask)),
+			"mean_power": mean_power,
+			"median_power": median_power,
+			"max_power": max_power,
+		})
+	return summaries
+
 def compute_empirical_pcf(points: np.ndarray, num_bins: int = 80, r_max: float = 4.0) -> tuple[np.ndarray, np.ndarray]:
 	# Equation 1 diagnostic: normalized pair-distance histogram in toroidal coordinates.
 	points = np.asarray(points, dtype=np.float64)
@@ -148,9 +251,9 @@ def plot_periodogram(power: np.ndarray, extent: tuple[float, float, float, float
 	display_power = np.array(power, dtype=np.float64, copy=True)
 	center_y = display_power.shape[0] // 2
 	center_x = display_power.shape[1] // 2
-	display_power[center_y, center_x] = np.nan
+	display_power[center_y, center_x] = 0.0
 	log_power = np.log1p(display_power)
-	vmin, vmax = np.nanpercentile(log_power, [2.0, 99.0])
+	vmin, vmax = np.percentile(log_power, [2.0, 99.0])
 	fig, ax = plt.subplots(figsize=(5.6, 5.2))
 	image = ax.imshow(
 		log_power,

@@ -27,6 +27,7 @@ from ds_wave_target import (
 	linprog_status_name,
 	make_hankel_matrix,
 	solve_ds_wave_target,
+	solve_ds_wave_target_for_targetrdf,
 	trapezoid_weights,
 )
 
@@ -47,14 +48,17 @@ from ds_wave_targetrdf import (
 from ds_wave_spectrum import (
 	direct_mode_power,
 	make_frequency_modes,
+	refine_low_frequency_modes,
 	synthesize_spectrum_matching_points,
 )
 
 
 from ds_wave_diagnostics import (
 	compute_empirical_pcf,
+	compute_low_frequency_mode_powers,
 	compute_periodogram_2d,
 	compute_radial_psd,
+	compute_target_mode_powers,
 	make_centered_integer_axis,
 	plot_ds_wave_targets,
 	plot_pcf_overlay,
@@ -62,12 +66,14 @@ from ds_wave_diagnostics import (
 	plot_points,
 	plot_radial_psd_overlay,
 	save_figure,
+	summarise_mode_power_bands,
 )
 
 
 class SynthesisMode(Enum):
 	SPECTRUM_MATCHING = "spectrum_matching"
 	PCF_MATCHING = "pcf_matching"
+	LOW_FREQUENCY_REFINE = "low_frequency_refine"
 
 
 def parse_synthesis_mode(value: SynthesisMode | str) -> SynthesisMode:
@@ -101,6 +107,14 @@ def synthesize_toroidal_points(
 	pcf_num_bins: int | None = None,
 	pcf_smoothing: float = 8.0,
 	pcf_chunk_size: int = 256,
+	pcf_track_low_frequency: bool = False,
+	pcf_low_frequency_nu: float | None = None,
+	pcf_diagnostic_log_every: int | None = None,
+	low_frequency_refine_iterations: int = 250,
+	low_frequency_refine_learning_rate: float = 0.01,
+	low_frequency_refine_nu: float | None = None,
+	low_frequency_refine_mode_limit: int = 0,
+	low_frequency_refine_mode_chunk_size: int = 512,
 ) -> dict:
 	mode = parse_synthesis_mode(synthesis_mode)
 	if mode is SynthesisMode.SPECTRUM_MATCHING:
@@ -129,9 +143,26 @@ def synthesize_toroidal_points(
 			chunk_size=pcf_chunk_size,
 			initial_points=initial_points,
 			log_every=log_every,
+			track_low_frequency=pcf_track_low_frequency,
+			low_frequency_nu=pcf_low_frequency_nu,
+			diagnostic_log_every=pcf_diagnostic_log_every,
 		)
 		result["synthesis_mode"] = SynthesisMode.PCF_MATCHING.value
 		return result
+	if mode is SynthesisMode.LOW_FREQUENCY_REFINE:
+		if initial_points is None:
+			raise ValueError("LOW_FREQUENCY_REFINE requires initial_points from a previous synthesis pass")
+		return refine_low_frequency_modes(
+			initial_points,
+			target,
+			iterations=low_frequency_refine_iterations,
+			device=device,
+			learning_rate=low_frequency_refine_learning_rate,
+			low_frequency_nu=low_frequency_refine_nu,
+			mode_limit=low_frequency_refine_mode_limit,
+			mode_chunk_size=low_frequency_refine_mode_chunk_size,
+			log_every=log_every,
+		)
 	raise ValueError(f"unknown synthesis mode: {synthesis_mode!r}")
 
 
@@ -151,6 +182,11 @@ def parse_m0_values(values_text: list[str]) -> list[float | str]:
 
 def parse_args() -> argparse.Namespace:
 	parser = argparse.ArgumentParser(description="Solve and smoke-test DS-Wave non-adaptive targets.")
+	cli_synthesis_mode_choices = [
+		mode.value
+		for mode in SynthesisMode
+		if mode is not SynthesisMode.LOW_FREQUENCY_REFINE
+	]
 	parser.add_argument("--nu0", type=float, default=0.85)
 	parser.add_argument("--e0", type=float, default=0.0)
 	parser.add_argument("--nu-max", type=float, default=10.0)
@@ -162,7 +198,7 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--m0-values", nargs="+", default=["1", "2", "min"])
 	parser.add_argument("--output-dir", type=Path, default=python_dir / "ds_wave_outputs")
 	parser.add_argument("--device", default="auto")
-	parser.add_argument("--synthesis-mode", choices=[mode.value for mode in SynthesisMode], default=SynthesisMode.SPECTRUM_MATCHING.value)
+	parser.add_argument("--synthesis-mode", choices=cli_synthesis_mode_choices, default=SynthesisMode.SPECTRUM_MATCHING.value)
 	parser.add_argument("--spectrum-learning-rate", type=float, default=0.03)
 	parser.add_argument("--pcf-step-scale", type=float, default=1.0)
 	parser.add_argument("--pcf-num-bins", type=int, default=None)

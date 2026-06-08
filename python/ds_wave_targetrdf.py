@@ -20,7 +20,7 @@ import math
 
 import numpy as np
 
-from ds_wave_target import evaluate_target_pcf, interpolate_target_pcf
+from ds_wave_target import evaluate_target_pcf
 
 
 try:
@@ -240,6 +240,76 @@ def compute_targetrdf_gradients(points, force_curve: np.ndarray, chunk_size: int
 	max_gradient = torch.sqrt(torch.max(torch.sum(gradients * gradients, dim=1))).item()
 	return gradients, max_gradient
 
+def _make_low_frequency_modes(n_points: int, nu_max: float) -> np.ndarray:
+	max_mode = max(1, int(math.ceil(nu_max * math.sqrt(float(n_points)))))
+	values = np.arange(-max_mode, max_mode + 1, dtype=np.int32)
+	kx, ky = np.meshgrid(values, values, indexing="xy")
+	modes = np.stack([kx.ravel(), ky.ravel()], axis=1)
+	nonzero = np.any(modes != 0, axis=1)
+	modes = modes[nonzero]
+	radii = np.linalg.norm(modes.astype(np.float64), axis=1) / math.sqrt(float(n_points))
+	return modes[radii <= nu_max]
+
+def _direct_low_frequency_mode_power(points: np.ndarray, modes: np.ndarray, chunk_size: int = 2048) -> np.ndarray:
+	points = np.asarray(points, dtype=np.float64)
+	modes = np.asarray(modes, dtype=np.float64)
+	powers = []
+	for start in range(0, modes.shape[0], chunk_size):
+		chunk = modes[start:start + chunk_size]
+		phase = 2.0 * math.pi * (points @ chunk.T)
+		real = np.cos(phase).sum(axis=0)
+		imag = np.sin(phase).sum(axis=0)
+		powers.append((real * real + imag * imag) / float(points.shape[0]))
+	return np.concatenate(powers, axis=0)
+
+def _summarise_low_frequency_bands(radii: np.ndarray, powers: np.ndarray, low_frequency_nu: float) -> list[dict]:
+	base_bands = [(0.0, 0.5), (0.5, 0.6), (0.6, 0.67), (0.67, low_frequency_nu)]
+	summaries = []
+	for low, high in base_bands:
+		clipped_high = min(float(high), float(low_frequency_nu))
+		if clipped_high <= low:
+			continue
+		mask = (radii >= low) & (radii < clipped_high)
+		if np.any(mask):
+			mean_power = float(np.mean(powers[mask]))
+			median_power = float(np.median(powers[mask]))
+			max_power = float(np.max(powers[mask]))
+		else:
+			mean_power = 0.0
+			median_power = 0.0
+			max_power = 0.0
+		summaries.append({
+			"range": (float(low), float(clipped_high)),
+			"count": int(np.sum(mask)),
+			"mean_power": mean_power,
+			"median_power": median_power,
+			"max_power": max_power,
+		})
+	return summaries
+
+def _compute_low_frequency_diagnostic_entry(
+	points: np.ndarray,
+	low_frequency_nu: float,
+	iteration: int,
+	best_energy: float,
+	current_step_scale: float,
+) -> dict:
+	modes = _make_low_frequency_modes(points.shape[0], low_frequency_nu)
+	if modes.shape[0] == 0:
+		raise ValueError("no Fourier modes available for the requested low_frequency_nu")
+	radii = np.linalg.norm(modes.astype(np.float64), axis=1) / math.sqrt(float(points.shape[0]))
+	powers = _direct_low_frequency_mode_power(points, modes)
+	return {
+		"iteration": int(iteration),
+		"best_energy": float(best_energy),
+		"current_step_scale": float(current_step_scale),
+		"mean_power": float(np.mean(powers)),
+		"median_power": float(np.median(powers)),
+		"max_power": float(np.max(powers)),
+		"mode_count": int(modes.shape[0]),
+		"band_summaries": _summarise_low_frequency_bands(radii, powers, low_frequency_nu),
+	}
+
 def synthesize_targetrdf_points(
 	target: dict,
 	n_points: int = 128,
@@ -252,6 +322,9 @@ def synthesize_targetrdf_points(
 	chunk_size: int = 256,
 	initial_points: np.ndarray | None = None,
 	log_every: int | None = None,
+	track_low_frequency: bool = False,
+	low_frequency_nu: float | None = None,
+	diagnostic_log_every: int | None = None,
 ) -> dict:
 	"""Synthesize points whose RDF follows a solved DS-Wave target.
 
@@ -277,6 +350,8 @@ def synthesize_targetrdf_points(
 		raise ValueError("step_scale must be positive")
 	if chunk_size < 1:
 		raise ValueError("chunk_size must be positive")
+	if track_low_frequency and (low_frequency_nu is None or low_frequency_nu <= 0.0):
+		raise ValueError("low_frequency_nu must be positive when track_low_frequency is enabled")
 	if torch is None:
 		raise RuntimeError("torch is required for point synthesis")
 
@@ -304,8 +379,10 @@ def synthesize_targetrdf_points(
 	# target_rdf_np and rdf_np live on CPU as NumPy curves. Point updates live on torch tensors.
 	target_rdf_np, unit_r_np = make_targetrdf_target_curve(target, n_points, nbins, smoothing)
 	# target_pcf_np is returned for plotting/diagnostics. The optimizer itself
-	# uses target_rdf_np, computed from the spectrum above.
-	target_pcf_np = np.maximum(interpolate_target_pcf(target, unit_r_np * math.sqrt(float(n_points))), 0.0)
+	# uses target_rdf_np, computed from the same spectrum evaluation path above.
+	# Do not interpolate target["g"] here: TargetRDF may need radii beyond the
+	# LP's stored r grid, and interpolation would clamp the tail.
+	target_pcf_np = np.maximum(evaluate_target_pcf(target, unit_r_np * math.sqrt(float(n_points))), 0.0)
 	rdf_np = compute_targetrdf_rdf(current, nbins, smoothing=smoothing, chunk_size=chunk_size)
 	energy = compute_targetrdf_energy(rdf_np, target_rdf_np)
 
@@ -317,6 +394,13 @@ def synthesize_targetrdf_points(
 	attempts = 0
 	current_step_scale = float(step_scale)
 	energy_history = []
+	diagnostic_history = []
+	# Low-frequency diagnostics can be expensive because they evaluate exact
+	# Fourier modes. Prefer explicit cadence, then synthesis log cadence, then a
+	# bounded default of about ten reports per run.
+	diagnostic_cadence = diagnostic_log_every if diagnostic_log_every is not None else log_every
+	if diagnostic_cadence is None:
+		diagnostic_cadence = max(iterations // 10, 1)
 	iterations_run = 0
 
 	for iteration in range(iterations):
@@ -352,11 +436,27 @@ def synthesize_targetrdf_points(
 		iterations_run += 1
 		if log_every is None or iteration % max(log_every, 1) == 0 or iteration == iterations - 1:
 			energy_history.append(best_energy)
+		if track_low_frequency and (iteration % max(diagnostic_cadence, 1) == 0 or iteration == iterations - 1):
+			diagnostic_history.append(_compute_low_frequency_diagnostic_entry(
+				best.detach().cpu().numpy(),
+				float(low_frequency_nu),
+				iteration,
+				best_energy,
+				current_step_scale,
+			))
 
 	if iterations == 0:
 		energy_history.append(best_energy)
+		if track_low_frequency:
+			diagnostic_history.append(_compute_low_frequency_diagnostic_entry(
+				best.detach().cpu().numpy(),
+				float(low_frequency_nu),
+				0,
+				best_energy,
+				current_step_scale,
+			))
 
-	return {
+	result = {
 		"points": best.detach().cpu().numpy(),
 		"energy_history": np.array(energy_history, dtype=np.float64),
 		"r_values": unit_r_np * math.sqrt(float(n_points)),
@@ -371,4 +471,6 @@ def synthesize_targetrdf_points(
 		"pcf_final_step_scale": current_step_scale,
 		"device": str(torch_device),
 	}
-
+	if track_low_frequency:
+		result["diagnostic_history"] = diagnostic_history
+	return result

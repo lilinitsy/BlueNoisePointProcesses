@@ -157,6 +157,128 @@ def synthesize_spectrum_matching_points(
 		"synthesis_mode": "spectrum_matching",
 	}
 
+
+def refine_low_frequency_modes(
+	initial_points: np.ndarray,
+	target: dict,
+	iterations: int = 250,
+	device: str | None = "auto",
+	learning_rate: float = 0.01,
+	low_frequency_nu: float | None = None,
+	mode_limit: int = 0,
+	mode_chunk_size: int = 512,
+	log_every: int | None = None,
+) -> dict:
+	if torch is None:
+		raise RuntimeError("torch is required for low-frequency refinement")
+	if iterations < 0:
+		raise ValueError("iterations must be non-negative")
+	if learning_rate <= 0.0:
+		raise ValueError("learning_rate must be positive")
+	if mode_chunk_size < 1:
+		raise ValueError("mode_chunk_size must be positive")
+
+	initial_points = np.asarray(initial_points, dtype=np.float32)
+	if initial_points.ndim != 2 or initial_points.shape[1] != 2 or initial_points.shape[0] < 1:
+		raise ValueError("initial_points must have shape (n_points, 2)")
+
+	n_points = int(initial_points.shape[0])
+	if low_frequency_nu is None:
+		low_frequency_nu = float(target["nu0"])
+	else:
+		low_frequency_nu = float(low_frequency_nu)
+	if low_frequency_nu <= 0.0:
+		raise ValueError("low_frequency_nu must be positive")
+
+	# Practical, non-pure DS-Wave cleanup: suppress residual Fourier leakage in
+	# the low-frequency hole after another synthesis method has produced points.
+	modes_np = make_frequency_modes(
+		n_points,
+		nu_max=low_frequency_nu,
+		mode_limit=mode_limit,
+		seed=0,
+		priority_nu=low_frequency_nu,
+	)
+	if modes_np.shape[0] == 0:
+		raise ValueError("no Fourier modes available for low-frequency refinement")
+
+	torch_device = choose_torch_device(device)
+	torch_dtype = torch.float32
+	wrapped_initial = np.remainder(initial_points, 1.0)
+	points = torch.tensor(wrapped_initial, dtype=torch_dtype, device=torch_device, requires_grad=True)
+	modes = torch.as_tensor(modes_np, dtype=torch_dtype, device=torch_device)
+	optimizer = torch.optim.Adam([points], lr=learning_rate)
+	energy_history = []
+	history = []
+
+	def compute_energy() -> torch.Tensor:
+		energy_sum = torch.zeros((), dtype=torch_dtype, device=torch_device)
+		mode_count = 0
+		for start in range(0, modes.shape[0], mode_chunk_size):
+			end = min(start + mode_chunk_size, modes.shape[0])
+			mode_chunk = modes[start:end]
+			phase = 2.0 * math.pi * (points @ mode_chunk.T)
+			real = torch.cos(phase).sum(dim=0)
+			imag = torch.sin(phase).sum(dim=0)
+			power = (real * real + imag * imag) / float(n_points)
+			energy_sum = energy_sum + torch.sum(power)
+			mode_count += end - start
+		return energy_sum / float(mode_count)
+
+	for iteration in range(iterations):
+		optimizer.zero_grad()
+		energy = compute_energy()
+		energy.backward()
+		optimizer.step()
+		with torch.no_grad():
+			points.remainder_(1.0)
+		if log_every is None or iteration % max(log_every, 1) == 0 or iteration == iterations - 1:
+			energy_value = float(energy.detach().cpu())
+			energy_history.append(energy_value)
+			history.append({"iteration": iteration, "energy": energy_value})
+
+	if iterations == 0:
+		with torch.no_grad():
+			energy_value = float(compute_energy().detach().cpu())
+			energy_history.append(energy_value)
+			history.append({"iteration": 0, "energy": energy_value})
+
+	final_points = points.detach().cpu().numpy()
+	initial_powers = direct_mode_power(wrapped_initial, modes_np, chunk_size=mode_chunk_size)
+	final_powers = direct_mode_power(final_points, modes_np, chunk_size=mode_chunk_size)
+	mode_radii = np.linalg.norm(modes_np, axis=1) / math.sqrt(float(n_points))
+	metadata = {
+		"low_frequency_nu": low_frequency_nu,
+		"mode_count": int(modes_np.shape[0]),
+		"mode_limit": mode_limit,
+		"mode_chunk_size": mode_chunk_size,
+		"learning_rate": learning_rate,
+		"iterations": iterations,
+		"device": str(torch_device),
+		"synthesis_mode": "low_frequency_refine",
+	}
+
+	return {
+		"points": final_points,
+		"energy_history": np.array(energy_history, dtype=np.float64),
+		"history": history,
+		"metadata": metadata,
+		"iterations_run": iterations,
+		"modes": modes_np,
+		"mode_radii": mode_radii,
+		"mode_count": int(modes_np.shape[0]),
+		"initial_powers": initial_powers,
+		"final_powers": final_powers,
+		"initial_mean_power": float(np.mean(initial_powers)),
+		"final_mean_power": float(np.mean(final_powers)),
+		"initial_max_power": float(np.max(initial_powers)),
+		"final_max_power": float(np.max(final_powers)),
+		"low_frequency_nu": low_frequency_nu,
+		"device": str(torch_device),
+		"synthesis_mode": "low_frequency_refine",
+	}
+
+
 def direct_mode_power(points: np.ndarray, modes: np.ndarray, chunk_size: int = 2048) -> np.ndarray:
 	# Equation 2 empirical power for explicit Fourier mode vectors.
 	points = np.asarray(points, dtype=np.float64)
