@@ -1,12 +1,9 @@
-from __future__ import annotations
-
 """TargetRDF point synthesis for DS-Wave targets.
+DS-wave solves second-order radial PSD P(nu), and F(nu) = P(nu) - 1.
+It then solves the PCF, g(r).
 
-DS-Wave itself solves for desired second-order statistics: a radial power
-spectrum P(nu), shifted spectrum F(nu) = P(nu) - 1, and the corresponding pair
-correlation function g(r). This module turns that target into an actual point
-set by matching the radial distribution function (RDF), following the
-Heck/Schlomer/Deussen TargetRDF optimizer used by the DS-Wave paper.
+This file takes that target and solves the point set using
+the Heck 2013 optimizer, as the DS-wave paper does.
 
 Coordinate systems used here:
 - Unit-square coordinates: point positions and toroidal distances in [0, 1).
@@ -15,18 +12,63 @@ Coordinate systems used here:
   is the radius used by the DS-Wave target spectrum/PCF.
 - RDF bins: a 1D sampled curve over unit-square distances [0, 0.5).
 """
+from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 import numpy as np
 
-from ds_wave_target import evaluate_target_pcf
-
+from ds_wave_target import DsWaveTarget, evaluate_target_pcf
 
 try:
 	import torch
 except ImportError:
 	torch = None
+
+
+# Default RDF bin count, decoupled from the point count. Heck ties nbins=N for
+# noise reasons, but at the achievable N=1024 that coarsens the force curve and
+# (worse) widens the smoothing kernel in normalized distance. A fixed, larger
+# grid resolves the sharp first shell regardless of point count.
+DEFAULT_TARGETRDF_NBINS = 4096
+
+# Heck's reference uses sigma=8 bins at nbins=N=4096 over unit-square [0, 0.5],
+# i.e. sigma in normalized DS-Wave distance = 8 * (0.5/4096) * sqrt(4096) =
+# 0.0625. We hold this normalized-distance sigma regardless of (N, nbins) so the
+# first shell (FWHM ~ 0.142 in r_norm) is never crushed. A slightly tighter
+# value than 0.0625 keeps more of the peak while still suppressing bin noise.
+DEFAULT_TARGETRDF_SIGMA_RNORM = 0.04
+
+
+@dataclass
+class SynthesisResult:
+	"""Output of synthesize_targetrdf_points.
+
+	  points            ndarray  (n_points, 2) toroidal positions in [0, 1);
+	                             the best (lowest-energy) set seen, not the last.
+	  energy_history    ndarray  best L2 RDF error per logged iteration.
+	  r_values          ndarray  (nbins,) normalized radii of the RDF bins.
+	  target_pcf        ndarray  (nbins,) unsmoothed target g at r_values.
+	  target_rdf        ndarray  (nbins,) smoothed target the optimizer chased.
+	  final_rdf         ndarray  (nbins,) smoothed RDF of the returned points.
+	  iterations_run    int
+	  nbins             int      effective RDF bin count used.
+	  smoothing         float    effective Gaussian sigma (in bins) used.
+	  final_step_scale  float    step scale after decay, for resuming/diagnosis.
+	  device            str      torch device the synthesis ran on.
+	"""
+	points: np.ndarray
+	energy_history: np.ndarray
+	r_values: np.ndarray
+	target_pcf: np.ndarray
+	target_rdf: np.ndarray
+	final_rdf: np.ndarray
+	iterations_run: int
+	nbins: int
+	smoothing: float
+	final_step_scale: float
+	device: str
 
 
 def choose_torch_device(device: str | None = None):
@@ -61,57 +103,99 @@ def choose_torch_device(device: str | None = None):
 			return torch.device("cpu")
 	return requested
 
+
+def resolve_targetrdf_resolution(
+	n_points: int,
+	nbins: int | None,
+	smoothing: float | None,
+) -> tuple[int, float]:
+	"""Resolve the effective (nbins, smoothing) for PCF matching.
+
+	When ``nbins`` is unset, use a fixed grid (decoupled from N) large enough to
+	resolve the first RDF shell. When ``smoothing`` is unset, choose the bin
+	sigma that holds a fixed normalized-distance sigma
+	(``DEFAULT_TARGETRDF_SIGMA_RNORM``): ``sigma_rnorm = sigma_bins * (0.5/nbins)
+	* sqrt(N)``, so ``sigma_bins = sigma_rnorm * nbins / (0.5 * sqrt(N))``.
+
+	Kept as a single helper so the synthesis loop and the regression tests agree
+	on the defaults.
+	"""
+	if n_points < 2:
+		raise ValueError("n_points must be at least 2 for PCF matching")
+	effective_nbins = int(max(DEFAULT_TARGETRDF_NBINS, n_points) if nbins is None else nbins)
+	if smoothing is None:
+		effective_smoothing = DEFAULT_TARGETRDF_SIGMA_RNORM * effective_nbins / (0.5 * math.sqrt(float(n_points)))
+	else:
+		effective_smoothing = float(smoothing)
+	return (effective_nbins, effective_smoothing)
+
+
 def smooth_curve_gaussian(values: np.ndarray, sigma: float) -> np.ndarray:
 	"""Smooth a 1D curve with a Gaussian measured in bins.
 
-	TargetRDF smooths RDF curves before comparing them. `sigma` is not a
-	physical distance; it is a number of histogram bins. For example, sigma=8
-	means each bin averages nearby bins with an 8-bin Gaussian scale.
+	`sigma` is not a physical distance; it is a number of histogram bins (e.g.
+	sigma=8 averages each bin with its neighbours on an 8-bin Gaussian scale).
+	The window is hard-truncated at 5 sigma and the weights are renormalized at
+	the array edges, matching Heck's FilterGauss boundary handling.
 	"""
 	values = np.asarray(values, dtype=np.float64)
 	if sigma <= 0.0:
 		return values.copy()
 
-	smoothed = np.empty_like(values)
-	for index in range(values.shape[0]):
-		# Use a finite 5-sigma window so this remains O(n * sigma) instead of O(n^2).
-		j_min = max(0, int(math.floor(index - 5.0 * sigma)))
-		j_max = min(values.shape[0] - 1, int(math.ceil(index + 5.0 * sigma)))
-		indices = np.arange(j_min, j_max + 1, dtype=np.float64)
-		weights = np.exp(-((indices - float(index)) ** 2) / (2.0 * sigma * sigma))
-		smoothed[index] = np.sum(values[j_min:j_max + 1] * weights) / np.sum(weights)
-	return smoothed
+	radius = int(math.ceil(5.0 * sigma))
+	offsets = np.arange(-radius, radius + 1, dtype=np.float64)
+	kernel = np.exp(-(offsets * offsets) / (2.0 * sigma * sigma))
 
-def make_targetrdf_target_curve(target: dict, n_points: int, nbins: int, smoothing: float) -> tuple[np.ndarray, np.ndarray]:
+	if values.shape[0] <= 2 * radius:
+		# Window wider than the curve: compute the (small) dense weight matrix.
+		positions = np.arange(values.shape[0], dtype=np.float64)
+		weights = np.exp(-((positions[:, None] - positions[None, :]) ** 2) / (2.0 * sigma * sigma))
+		weights[np.abs(positions[:, None] - positions[None, :]) > radius] = 0.0
+		return (weights @ values) / np.sum(weights, axis=1)
+
+	# Convolve values and a ones-array with the same kernel: dividing the two
+	# renormalizes the weights wherever the window is clipped by an array edge.
+	numerator = np.convolve(values, kernel, mode="same")
+	denominator = np.convolve(np.ones_like(values), kernel, mode="same")
+	return numerator / denominator
+
+
+def make_targetrdf_target_curve(
+	target: DsWaveTarget,
+	n_points: int,
+	nbins: int,
+	smoothing: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 	"""Convert the solved DS-Wave spectrum into a TargetRDF curve.
 
-	The DS-Wave solver stores its PCF samples on `target["r"]`, but that grid may
-	not cover the whole TargetRDF unit-square distance range once multiplied by
-	sqrt(N). To avoid clamping to the last stored g(r) value, we evaluate g(r)
+	The DS-Wave solver stores its PCF samples on target.r, but that grid may not
+	cover the whole TargetRDF unit-square distance range once multiplied by
+	sqrt(N). To avoid clamping to the last stored g(r) value, g is evaluated
 	directly from F(nu) at the exact radii TargetRDF needs.
 
-	Shapes:
-	- target_rdf: (nbins,), desired g(r) values.
-	- unit_r: (nbins,), toroidal distances in unit-square coordinates.
+	Returns (target_rdf, target_pcf, unit_r):
+	- target_rdf: (nbins,), smoothed g(r) the optimizer chases.
+	- target_pcf: (nbins,), the same g(r) before smoothing (for plots).
+	- unit_r: (nbins,), toroidal bin distances in unit-square coordinates.
 	"""
 	# Heck et al. targetrdf works in unit-square distances x in [0, 0.5].
-	dx = 0.5 / float(nbins)
 	# Bin locations match targetrdf.cc Curve::ToX(index): x0 + index * dx.
+	dx = 0.5 / float(nbins)
 	unit_r = np.arange(nbins, dtype=np.float64) * dx
 	normalised_r = unit_r * math.sqrt(float(n_points))
-	# Evaluate from the spectrum so large unit-square distances do not clamp to target["g"][-1].
-	target_g = np.maximum(evaluate_target_pcf(target, normalised_r), 0.0)
-	return smooth_curve_gaussian(target_g, smoothing), unit_r
+	target_pcf = np.maximum(evaluate_target_pcf(target, normalised_r), 0.0)
+	target_rdf = smooth_curve_gaussian(target_pcf, smoothing)
+	return (target_rdf, target_pcf, unit_r)
+
 
 def compute_targetrdf_force_curve(rdf: np.ndarray, target_rdf: np.ndarray, n_points: int) -> np.ndarray:
 	"""Build the radial force curve from current-vs-target RDF error.
 
-	Heck et al. 2013 targetrdf.cc, CalcGradients(): cumulative RDF error divided by N*r^2.
-
-	The result is a scalar lookup table. It is not a 2D vector yet:
-	`force_curve[k]` says how strongly pairs at distance about `k * dx` should
-	push/pull. `compute_targetrdf_gradients()` later multiplies this scalar by
-	the actual wrapped pair direction to get a 2D update.
+	Heck et al. 2013 targetrdf.cc, CalcGradients(): cumulative RDF error divided
+	by N*r^2. The result is a scalar lookup table, not a 2D vector yet:
+	force[k] says how strongly pairs at distance about k*dx should push/pull.
+	compute_targetrdf_gradients() later multiplies this scalar by the actual
+	wrapped pair direction to get a 2D update.
 	"""
 	rdf = np.asarray(rdf, dtype=np.float64)
 	target_rdf = np.asarray(target_rdf, dtype=np.float64)
@@ -123,39 +207,37 @@ def compute_targetrdf_force_curve(rdf: np.ndarray, target_rdf: np.ndarray, n_poi
 		raise ValueError("n_points must be at least 2")
 
 	dx = 0.5 / float(rdf.shape[0])
-	# Start with per-bin RDF error. Multiplying by dx turns the discrete bin differences into a simple integral contribution over distance.
-	force = dx * (rdf - target_rdf)
-	# Integrate error from radius 0 outwards. Positive means "too many pairs up to this radius"; negative means "too few pairs up to this radius".
-	force = np.cumsum(force)
+	# Integrate the per-bin RDF error from radius 0 outwards. Positive means
+	# "too many pairs up to this radius", negative means "too few".
+	force = np.cumsum(dx * (rdf - target_rdf))
 	# Radius 0 would divide by x^2 below, so keep the zero-distance force finite.
 	force[0] = 0.0
-	for index in range(1, force.shape[0]):
-		x = index * dx
-		# TargetRDF normalizes by N and r^2 before using this as a scalar lookup: distance -> pair-force strength. The 2D direction comes later.
-		force[index] /= float(n_points) * x * x
+	x = np.arange(1, force.shape[0], dtype=np.float64) * dx
+	force[1:] /= float(n_points) * x * x
 	return force
+
 
 def compute_targetrdf_energy(rdf: np.ndarray, target_rdf: np.ndarray) -> float:
 	"""Return the L2 distance between two RDF curves over [0, 0.5].
 
-	This is the optimizer's acceptance metric. Lower means the current point
-	set's measured pair-distance statistics are closer to the desired target.
+	This is the optimizer's acceptance metric: lower means the measured
+	pair-distance statistics are closer to the target.
 	"""
 	diff = np.asarray(rdf, dtype=np.float64) - np.asarray(target_rdf, dtype=np.float64)
 	dx = 0.5 / float(diff.shape[0])
 	return float(math.sqrt(dx * np.sum(diff * diff)))
 
+
 def compute_targetrdf_rdf(points, nbins: int, smoothing: float = 8.0, chunk_size: int = 256) -> np.ndarray:
 	"""Estimate the toroidal radial distribution function for a point set.
 
 	The RDF measures how many point pairs occur at each distance relative to a
-	random uniform point set. Values near 0 mean pairs at that distance are
-	suppressed. Values near 1 mean random-like. Values above 1 mean more pairs
-	than random at that radius.
+	random uniform point set: ~0 means pairs suppressed, ~1 random-like, >1 more
+	pairs than random at that radius.
 
 	Shapes:
-	- points: (n_points, 2), in [0, 1).
-	- counts/rdf: (nbins,), radial bins for distances in [0, 0.5).
+	- points: (n_points, 2) torch tensor, in [0, 1).
+	- return: (nbins,) numpy array, radial bins for distances in [0, 0.5).
 	"""
 	if nbins < 2:
 		raise ValueError("nbins must be at least 2")
@@ -169,7 +251,7 @@ def compute_targetrdf_rdf(points, nbins: int, smoothing: float = 8.0, chunk_size
 		all_indices = torch.arange(n_points, device=points.device)
 		for start in range(0, n_points, chunk_size):
 			end = min(start + chunk_size, n_points)
-			# Pairwise chunk against all points: delta/distances have shape (end - start, n_points).
+			# Pairwise chunk against all points: shape (end - start, n_points).
 			row_indices = torch.arange(start, end, device=points.device)[:, None]
 			delta = points[start:end, None, :] - points[None, :, :]
 			# Wrap each displacement to the nearest toroidal image in [-0.5, 0.5].
@@ -182,19 +264,19 @@ def compute_targetrdf_rdf(points, nbins: int, smoothing: float = 8.0, chunk_size
 				bin_indices = torch.clamp(bin_indices, 0, nbins - 1)
 				counts = counts + torch.bincount(bin_indices, minlength=nbins).to(dtype=torch.float64)
 
+	# Divide pair counts by the expected annulus area and the number of
+	# unordered pairs, so a uniform random set has RDF close to 1.
 	scale = float(n_points * (n_points - 1)) * 0.5 * math.pi * dx * dx
 	shell_indices = torch.arange(nbins, dtype=torch.float64, device=points.device)
-	# Divide pair counts by expected annulus area and number of unordered pairs. A random/uniform point set should therefore have RDF close to 1.
 	rdf = counts / (scale * (2.0 * shell_indices + 1.0))
-	rdf_np = rdf.cpu().numpy()
-	return smooth_curve_gaussian(rdf_np, smoothing)
+	return smooth_curve_gaussian(rdf.cpu().numpy(), smoothing)
+
 
 def interpolate_curve_torch(curve, x_values, x1: float = 0.5):
 	"""Linearly sample a 1D curve tensor at positions in [0, x1].
 
 	`x_values` can be a matrix of pair distances. The returned tensor has the
-	same shape as `x_values`, with each distance replaced by an interpolated
-	curve value.
+	same shape, with each distance replaced by an interpolated curve value.
 	"""
 	size = curve.shape[0]
 	dx = x1 / float(size)
@@ -204,17 +286,17 @@ def interpolate_curve_torch(curve, x_values, x1: float = 0.5):
 	alpha = (xx - index.to(dtype=x_values.dtype)).to(dtype=curve.dtype)
 	return (1.0 - alpha) * curve[index] + alpha * curve[next_index]
 
+
 def compute_targetrdf_gradients(points, force_curve: np.ndarray, chunk_size: int = 256):
 	"""Compute point updates induced by the radial force curve.
 
-	For each point, this sums contributions from all other points within the
-	reliable RDF radius. The force curve supplies a scalar based on pair
-	distance; the wrapped displacement supplies the 2D direction.
+	For each point, sums contributions from all other points within the
+	reliable RDF radius: the force curve supplies a scalar from the pair
+	distance, the wrapped displacement supplies the 2D direction.
 
-	Shapes:
-	- points: (n_points, 2).
-	- force_curve: (nbins,).
-	- gradients: (n_points, 2).
+	Returns (gradients, max_gradient): gradients has shape (n_points, 2);
+	max_gradient is the largest per-point gradient magnitude, used by the
+	caller to normalize the step size.
 	"""
 	if chunk_size < 1:
 		raise ValueError("chunk_size must be positive")
@@ -229,103 +311,31 @@ def compute_targetrdf_gradients(points, force_curve: np.ndarray, chunk_size: int
 			delta = points[None, :, :] - points[start:end, None, :]
 			delta = delta + (delta < -0.5).to(dtype=points.dtype) - (delta > 0.5).to(dtype=points.dtype)
 			dist2 = torch.sum(delta * delta, dim=2)
-			# targetrdf ignores distances above 0.49 to avoid toroidal anisotropy near the boundary.
+			# targetrdf ignores distances above 0.49 to avoid toroidal anisotropy.
 			mask = (dist2 > 0.0) & (dist2 <= 0.49 * 0.49)
 			distances = torch.sqrt(torch.clamp(dist2, min=1e-20))
 			pair_force = interpolate_curve_torch(force, distances)
 			pair_force = torch.where(mask, pair_force, torch.zeros_like(pair_force))
-			# pair_force is radial. Multiplying by the wrapped pair vector turns it into a 2D update direction, summed over neighbours for each point.
+			# pair_force is radial; multiplying by the wrapped pair vector turns
+			# it into a 2D update, summed over neighbours for each point.
 			gradients[start:end] = -torch.sum(delta * pair_force[:, :, None], dim=1)
-	# The caller uses this to normalize the largest per-point movement.
 	max_gradient = torch.sqrt(torch.max(torch.sum(gradients * gradients, dim=1))).item()
-	return gradients, max_gradient
+	return (gradients, max_gradient)
 
-def _make_low_frequency_modes(n_points: int, nu_max: float) -> np.ndarray:
-	max_mode = max(1, int(math.ceil(nu_max * math.sqrt(float(n_points)))))
-	values = np.arange(-max_mode, max_mode + 1, dtype=np.int32)
-	kx, ky = np.meshgrid(values, values, indexing="xy")
-	modes = np.stack([kx.ravel(), ky.ravel()], axis=1)
-	nonzero = np.any(modes != 0, axis=1)
-	modes = modes[nonzero]
-	radii = np.linalg.norm(modes.astype(np.float64), axis=1) / math.sqrt(float(n_points))
-	return modes[radii <= nu_max]
-
-def _direct_low_frequency_mode_power(points: np.ndarray, modes: np.ndarray, chunk_size: int = 2048) -> np.ndarray:
-	points = np.asarray(points, dtype=np.float64)
-	modes = np.asarray(modes, dtype=np.float64)
-	powers = []
-	for start in range(0, modes.shape[0], chunk_size):
-		chunk = modes[start:start + chunk_size]
-		phase = 2.0 * math.pi * (points @ chunk.T)
-		real = np.cos(phase).sum(axis=0)
-		imag = np.sin(phase).sum(axis=0)
-		powers.append((real * real + imag * imag) / float(points.shape[0]))
-	return np.concatenate(powers, axis=0)
-
-def _summarise_low_frequency_bands(radii: np.ndarray, powers: np.ndarray, low_frequency_nu: float) -> list[dict]:
-	base_bands = [(0.0, 0.5), (0.5, 0.6), (0.6, 0.67), (0.67, low_frequency_nu)]
-	summaries = []
-	for low, high in base_bands:
-		clipped_high = min(float(high), float(low_frequency_nu))
-		if clipped_high <= low:
-			continue
-		mask = (radii >= low) & (radii < clipped_high)
-		if np.any(mask):
-			mean_power = float(np.mean(powers[mask]))
-			median_power = float(np.median(powers[mask]))
-			max_power = float(np.max(powers[mask]))
-		else:
-			mean_power = 0.0
-			median_power = 0.0
-			max_power = 0.0
-		summaries.append({
-			"range": (float(low), float(clipped_high)),
-			"count": int(np.sum(mask)),
-			"mean_power": mean_power,
-			"median_power": median_power,
-			"max_power": max_power,
-		})
-	return summaries
-
-def _compute_low_frequency_diagnostic_entry(
-	points: np.ndarray,
-	low_frequency_nu: float,
-	iteration: int,
-	best_energy: float,
-	current_step_scale: float,
-) -> dict:
-	modes = _make_low_frequency_modes(points.shape[0], low_frequency_nu)
-	if modes.shape[0] == 0:
-		raise ValueError("no Fourier modes available for the requested low_frequency_nu")
-	radii = np.linalg.norm(modes.astype(np.float64), axis=1) / math.sqrt(float(points.shape[0]))
-	powers = _direct_low_frequency_mode_power(points, modes)
-	return {
-		"iteration": int(iteration),
-		"best_energy": float(best_energy),
-		"current_step_scale": float(current_step_scale),
-		"mean_power": float(np.mean(powers)),
-		"median_power": float(np.median(powers)),
-		"max_power": float(np.max(powers)),
-		"mode_count": int(modes.shape[0]),
-		"band_summaries": _summarise_low_frequency_bands(radii, powers, low_frequency_nu),
-	}
 
 def synthesize_targetrdf_points(
-	target: dict,
+	target: DsWaveTarget,
 	n_points: int = 128,
 	iterations: int = 100,
 	seed: int = 0,
 	device: str | None = "auto",
 	step_scale: float = 1.0,
 	nbins: int | None = None,
-	smoothing: float = 8.0,
+	smoothing: float | None = None,
 	chunk_size: int = 256,
 	initial_points: np.ndarray | None = None,
 	log_every: int | None = None,
-	track_low_frequency: bool = False,
-	low_frequency_nu: float | None = None,
-	diagnostic_log_every: int | None = None,
-) -> dict:
+) -> SynthesisResult:
 	"""Synthesize points whose RDF follows a solved DS-Wave target.
 
 	This follows the Heck/Schlomer/Deussen TargetRDF force construction, while
@@ -344,14 +354,12 @@ def synthesize_targetrdf_points(
 		raise ValueError("iterations must be non-negative")
 	if nbins is not None and nbins < 2:
 		raise ValueError("nbins must be at least 2")
-	if smoothing < 0.0:
+	if smoothing is not None and smoothing < 0.0:
 		raise ValueError("smoothing must be non-negative")
 	if step_scale <= 0.0:
 		raise ValueError("step_scale must be positive")
 	if chunk_size < 1:
 		raise ValueError("chunk_size must be positive")
-	if track_low_frequency and (low_frequency_nu is None or low_frequency_nu <= 0.0):
-		raise ValueError("low_frequency_nu must be positive when track_low_frequency is enabled")
 	if torch is None:
 		raise RuntimeError("torch is required for point synthesis")
 
@@ -361,7 +369,7 @@ def synthesize_targetrdf_points(
 	if torch_device.type == "cuda":
 		torch.cuda.manual_seed_all(seed)
 
-	nbins = int(n_points if nbins is None else nbins)
+	(nbins, smoothing) = resolve_targetrdf_resolution(n_points, nbins, smoothing)
 	torch_dtype = torch.float32
 	if initial_points is None:
 		# Start from a random toroidal point set in the unit square.
@@ -376,37 +384,25 @@ def synthesize_targetrdf_points(
 		# Keep user-provided points in the same toroidal [0, 1) domain.
 		current.remainder_(1.0)
 
-	# target_rdf_np and rdf_np live on CPU as NumPy curves. Point updates live on torch tensors.
-	target_rdf_np, unit_r_np = make_targetrdf_target_curve(target, n_points, nbins, smoothing)
-	# target_pcf_np is returned for plotting/diagnostics. The optimizer itself
-	# uses target_rdf_np, computed from the same spectrum evaluation path above.
-	# Do not interpolate target["g"] here: TargetRDF may need radii beyond the
-	# LP's stored r grid, and interpolation would clamp the tail.
-	target_pcf_np = np.maximum(evaluate_target_pcf(target, unit_r_np * math.sqrt(float(n_points))), 0.0)
+	# Curves live on CPU as NumPy arrays; point updates live on torch tensors.
+	(target_rdf_np, target_pcf_np, unit_r_np) = make_targetrdf_target_curve(target, n_points, nbins, smoothing)
 	rdf_np = compute_targetrdf_rdf(current, nbins, smoothing=smoothing, chunk_size=chunk_size)
 	energy = compute_targetrdf_energy(rdf_np, target_rdf_np)
 
-	# HSD13 tracks the best RDF match and rolls back unstable moves. Keeping this
-	# state avoids spatial islanding when a proposed step worsens the RDF too much.
+	# HSD13 tracks the best RDF match and rolls back unstable moves. Keeping
+	# this state avoids spatial islanding when a step worsens the RDF too much.
 	best = current.clone()
 	best_rdf_np = rdf_np.copy()
 	best_energy = energy
 	attempts = 0
 	current_step_scale = float(step_scale)
 	energy_history = []
-	diagnostic_history = []
-	# Low-frequency diagnostics can be expensive because they evaluate exact
-	# Fourier modes. Prefer explicit cadence, then synthesis log cadence, then a
-	# bounded default of about ten reports per run.
-	diagnostic_cadence = diagnostic_log_every if diagnostic_log_every is not None else log_every
-	if diagnostic_cadence is None:
-		diagnostic_cadence = max(iterations // 10, 1)
-	iterations_run = 0
+	log_cadence = 1 if log_every is None else max(log_every, 1)
 
 	for iteration in range(iterations):
 		# Recompute forces from the latest accepted/current RDF estimate.
 		force_curve_np = compute_targetrdf_force_curve(rdf_np, target_rdf_np, n_points)
-		gradients, max_gradient = compute_targetrdf_gradients(current, force_curve_np, chunk_size=chunk_size)
+		(gradients, max_gradient) = compute_targetrdf_gradients(current, force_curve_np, chunk_size=chunk_size)
 		if max_gradient > 1e-12:
 			# Scale the largest point displacement to current_step_scale / sqrt(N).
 			step_size = current_step_scale / (math.sqrt(float(n_points)) * max_gradient)
@@ -417,60 +413,38 @@ def synthesize_targetrdf_points(
 			energy = compute_targetrdf_energy(rdf_np, target_rdf_np)
 			attempts += 1
 			if energy < best_energy:
-				# Accept improvement and reset the failed-attempt counter.
+				# Accept the improvement and reset the failed-attempt counter.
 				best = current.clone()
 				best_rdf_np = rdf_np.copy()
 				best_energy = energy
 				attempts = 0
 			elif energy > best_energy * 1.2:
-				# Large regression: restore the best point set and force step decay.
+				# Large regression: restore the best set and force step decay.
 				current = best.clone()
 				rdf_np = best_rdf_np.copy()
 				energy = best_energy
 				attempts = 5
 			if attempts >= 5:
-				# Match targetrdf's temperature decay idea, but without ending early:
-				# keep the requested iteration budget and make future moves smaller.
+				# Match targetrdf's temperature decay idea, but without ending
+				# early: keep the iteration budget and make future moves smaller.
 				attempts = 0
 				current_step_scale *= 0.9
-		iterations_run += 1
-		if log_every is None or iteration % max(log_every, 1) == 0 or iteration == iterations - 1:
+		if iteration % log_cadence == 0 or iteration == iterations - 1:
 			energy_history.append(best_energy)
-		if track_low_frequency and (iteration % max(diagnostic_cadence, 1) == 0 or iteration == iterations - 1):
-			diagnostic_history.append(_compute_low_frequency_diagnostic_entry(
-				best.detach().cpu().numpy(),
-				float(low_frequency_nu),
-				iteration,
-				best_energy,
-				current_step_scale,
-			))
 
 	if iterations == 0:
 		energy_history.append(best_energy)
-		if track_low_frequency:
-			diagnostic_history.append(_compute_low_frequency_diagnostic_entry(
-				best.detach().cpu().numpy(),
-				float(low_frequency_nu),
-				0,
-				best_energy,
-				current_step_scale,
-			))
 
-	result = {
-		"points": best.detach().cpu().numpy(),
-		"energy_history": np.array(energy_history, dtype=np.float64),
-		"r_values": unit_r_np * math.sqrt(float(n_points)),
-		"target_pcf": target_pcf_np,
-		"target_rdf": target_rdf_np,
-		"final_rdf": best_rdf_np,
-		"iterations_run": iterations_run,
-		"pcf_algorithm": "targetrdf_force",
-		"pcf_num_bins": nbins,
-		"pcf_smoothing": smoothing,
-		"pcf_step_scale": step_scale,
-		"pcf_final_step_scale": current_step_scale,
-		"device": str(torch_device),
-	}
-	if track_low_frequency:
-		result["diagnostic_history"] = diagnostic_history
-	return result
+	return SynthesisResult(
+		points=best.detach().cpu().numpy(),
+		energy_history=np.array(energy_history, dtype=np.float64),
+		r_values=unit_r_np * math.sqrt(float(n_points)),
+		target_pcf=target_pcf_np,
+		target_rdf=target_rdf_np,
+		final_rdf=best_rdf_np,
+		iterations_run=iterations,
+		nbins=nbins,
+		smoothing=smoothing,
+		final_step_scale=current_step_scale,
+		device=str(torch_device),
+	)

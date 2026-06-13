@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 
 from ds_wave_spectrum import direct_mode_power, make_frequency_modes
-from ds_wave_target import interpolate_target_power
+from ds_wave_target import interpolate_target_pcf, interpolate_target_power
 
 
 def make_centered_integer_axis(k_max: int, grid_size: int) -> np.ndarray:
@@ -46,6 +46,34 @@ def compute_periodogram_2d(points: np.ndarray, grid_size: int = 96, max_freq: fl
 	)
 	return power, extent
 
+def bin_radial_values(
+	radii: np.ndarray,
+	values: np.ndarray,
+	num_bins: int,
+	max_freq: float,
+) -> tuple[np.ndarray, np.ndarray]:
+	"""Radially bin per-mode ``values``: per-bin mean with empty-bin interpolation.
+
+	Shared binning kernel used both by compute_radial_psd (empirical powers) and
+	by ds_wave_psd_eval.binned_target_power (target powers), so the two sides of
+	the fit metric always see identical bin definitions.
+	"""
+	radii = np.asarray(radii, dtype=np.float64)
+	values = np.asarray(values, dtype=np.float64)
+	edges = np.linspace(0.0, max_freq, num_bins + 1)
+	centres = 0.5 * (edges[:-1] + edges[1:])
+	binned = np.full(num_bins, np.nan, dtype=np.float64)
+	for index in range(num_bins):
+		mask = (radii >= edges[index]) & (radii < edges[index + 1])
+		if np.any(mask):
+			binned[index] = np.mean(values[mask])
+	valid = np.isfinite(binned)
+	if np.any(valid):
+		binned = np.interp(centres, centres[valid], binned[valid], left=binned[valid][0], right=binned[valid][-1])
+	else:
+		binned[:] = 0.0
+	return centres, binned
+
 def compute_radial_psd(
 	points: np.ndarray,
 	num_bins: int = 80,
@@ -58,19 +86,7 @@ def compute_radial_psd(
 	modes = make_frequency_modes(points.shape[0], nu_max=max_freq, mode_limit=mode_limit, seed=0, priority_nu=priority_nu)
 	radii = np.linalg.norm(modes, axis=1) / math.sqrt(float(points.shape[0]))
 	powers = direct_mode_power(points, modes)
-	edges = np.linspace(0.0, max_freq, num_bins + 1)
-	centres = 0.5 * (edges[:-1] + edges[1:])
-	radial = np.full(num_bins, np.nan, dtype=np.float64)
-	for index in range(num_bins):
-		mask = (radii >= edges[index]) & (radii < edges[index + 1])
-		if np.any(mask):
-			radial[index] = np.mean(powers[mask])
-	valid = np.isfinite(radial)
-	if np.any(valid):
-		radial = np.interp(centres, centres[valid], radial[valid], left=radial[valid][0], right=radial[valid][-1])
-	else:
-		radial[:] = 0.0
-	return centres, radial
+	return bin_radial_values(radii, powers, num_bins=num_bins, max_freq=max_freq)
 
 def compute_low_frequency_mode_powers(
 	points: np.ndarray,
@@ -209,13 +225,13 @@ def plot_ds_wave_targets(targets: list[dict]) -> plt.Figure:
 	import matplotlib.pyplot as plt
 
 	# Figure 9 style diagnostic: target P(nu) and the implied Equation 12 PCF.
-	fig, axes = plt.subplots(1, 2, figsize=(10.0, 4.0))
+	(fig, axes) = plt.subplots(1, 2, figsize=(10.0, 4.0))
 	for target in targets:
-		label = f"m0={target['m0']}"
-		if not target["success"]:
+		if not target.success:
 			continue
-		axes[0].plot(target["nu"], target["P"], label=label)
-		axes[1].plot(target["r"], target["g"], label=label)
+		label = f"m0={target.m0:.4g}" if target.m0 is not None else "m0=uncapped"
+		axes[0].plot(target.nu, target.P, label=label)
+		axes[1].plot(target.r, target.g, label=label)
 	axes[0].set_title("DS-Wave target power")
 	axes[0].set_xlabel("nu")
 	axes[0].set_ylabel("P(nu)")
@@ -274,9 +290,9 @@ def plot_radial_psd_overlay(points: np.ndarray, target: dict, max_freq: float = 
 	import matplotlib.pyplot as plt
 
 	# Compare empirical radial Equation 2 power against the variational target P = F + 1.
-	freqs, radial = compute_radial_psd(points, max_freq=max_freq, priority_nu=target.get("nu0"))
+	(freqs, radial) = compute_radial_psd(points, max_freq=max_freq, priority_nu=target.nu0)
 	target_power = interpolate_target_power(target, freqs)
-	fig, ax = plt.subplots(figsize=(7.0, 4.2))
+	(fig, ax) = plt.subplots(figsize=(7.0, 4.2))
 	ax.plot(freqs, radial, label="empirical", color="#174a7c", linewidth=2.0)
 	ax.plot(freqs, target_power, label="target", color="#9a3412", linewidth=2.0)
 	ax.set_title("Radial PSD")
@@ -292,9 +308,10 @@ def plot_pcf_overlay(points: np.ndarray, target: dict) -> plt.Figure:
 	import matplotlib.pyplot as plt
 
 	# Compare empirical Equation 1 PCF against g = H[F] + 1 from Equation 12.
-	r, empirical = compute_empirical_pcf(points, r_max=float(target["r"][-1]))
-	target_g = np.interp(r, target["r"], target["g"], left=target["g"][0], right=target["g"][-1])
-	fig, ax = plt.subplots(figsize=(7.0, 4.2))
+	# interpolate_target_pcf raises a clear error for unsolved (g=None) targets.
+	(r, empirical) = compute_empirical_pcf(points, r_max=float(target.r[-1]))
+	target_g = interpolate_target_pcf(target, r)
+	(fig, ax) = plt.subplots(figsize=(7.0, 4.2))
 	ax.plot(r, empirical, label="empirical", color="#174a7c", linewidth=2.0)
 	ax.plot(r, target_g, label="target", color="#9a3412", linewidth=2.0)
 	ax.set_title("Pair correlation")
