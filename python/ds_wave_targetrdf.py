@@ -29,15 +29,13 @@ except ImportError:
 
 # Default RDF bin count, decoupled from the point count. Heck ties nbins=N for
 # noise reasons, but at the achievable N=1024 that coarsens the force curve and
-# (worse) widens the smoothing kernel in normalized distance. A fixed, larger
-# grid resolves the sharp first shell regardless of point count.
+# (worse) widens the smoothing kernel in normalized distance. 
+# A fixed, larger grid resolves the sharp first shell regardless of point count.
 DEFAULT_TARGETRDF_NBINS = 4096
 
 # Heck's reference uses sigma=8 bins at nbins=N=4096 over unit-square [0, 0.5],
-# i.e. sigma in normalized DS-Wave distance = 8 * (0.5/4096) * sqrt(4096) =
-# 0.0625. We hold this normalized-distance sigma regardless of (N, nbins) so the
-# first shell (FWHM ~ 0.142 in r_norm) is never crushed. A slightly tighter
-# value than 0.0625 keeps more of the peak while still suppressing bin noise.
+# i.e. sigma in normalized DS-Wave distance = 8 * (0.5/4096) * sqrt(4096) = 0.0625. 
+# # A slightly tighter value than 0.0625 keeps more of the peak while still suppressing bin noise.
 DEFAULT_TARGETRDF_SIGMA_RNORM = 0.04
 
 
@@ -72,12 +70,6 @@ class SynthesisResult:
 
 
 def choose_torch_device(device: str | None = None):
-	"""Pick a usable torch device.
-
-	`device="auto"` prefers CUDA, but the probe allocation catches cases where
-	CUDA is installed but cannot actually execute on the current GPU. Returning
-	CPU here is better than letting a long synthesis run fail after setup.
-	"""
 	if torch is None:
 		raise RuntimeError("torch is required for point synthesis")
 	if device is None or device == "auto":
@@ -111,14 +103,11 @@ def resolve_targetrdf_resolution(
 ) -> tuple[int, float]:
 	"""Resolve the effective (nbins, smoothing) for PCF matching.
 
-	When ``nbins`` is unset, use a fixed grid (decoupled from N) large enough to
+	When nbins is unset, use a fixed grid (decoupled from N) large enough to
 	resolve the first RDF shell. When ``smoothing`` is unset, choose the bin
 	sigma that holds a fixed normalized-distance sigma
-	(``DEFAULT_TARGETRDF_SIGMA_RNORM``): ``sigma_rnorm = sigma_bins * (0.5/nbins)
-	* sqrt(N)``, so ``sigma_bins = sigma_rnorm * nbins / (0.5 * sqrt(N))``.
-
-	Kept as a single helper so the synthesis loop and the regression tests agree
-	on the defaults.
+	(DEFAULT_TARGETRDF_SIGMA_RNORM): 
+	sigma_rnorm = sigma_bins * (0.5/nbins) * sqrt(N), so sigma_bins = sigma_rnorm * nbins / (0.5 * sqrt(N)).
 	"""
 	if n_points < 2:
 		raise ValueError("n_points must be at least 2 for PCF matching")
@@ -133,10 +122,8 @@ def resolve_targetrdf_resolution(
 def smooth_curve_gaussian(values: np.ndarray, sigma: float) -> np.ndarray:
 	"""Smooth a 1D curve with a Gaussian measured in bins.
 
-	`sigma` is not a physical distance; it is a number of histogram bins (e.g.
-	sigma=8 averages each bin with its neighbours on an 8-bin Gaussian scale).
-	The window is hard-truncated at 5 sigma and the weights are renormalized at
-	the array edges, matching Heck's FilterGauss boundary handling.
+	sigma is a number of histogram bins (e.g. sigma=8 averages each bin with its neighbours on an 8-bin Gaussian scale).
+	The window is hard-truncated at 5 sigma and the weights are renormalized at the array edges, matching Heck's FilterGauss boundary handling.
 	"""
 	values = np.asarray(values, dtype=np.float64)
 	if sigma <= 0.0:
@@ -179,7 +166,6 @@ def make_targetrdf_target_curve(
 	- unit_r: (nbins,), toroidal bin distances in unit-square coordinates.
 	"""
 	# Heck et al. targetrdf works in unit-square distances x in [0, 0.5].
-	# Bin locations match targetrdf.cc Curve::ToX(index): x0 + index * dx.
 	dx = 0.5 / float(nbins)
 	unit_r = np.arange(nbins, dtype=np.float64) * dx
 	normalised_r = unit_r * math.sqrt(float(n_points))
@@ -190,12 +176,7 @@ def make_targetrdf_target_curve(
 
 def compute_targetrdf_force_curve(rdf: np.ndarray, target_rdf: np.ndarray, n_points: int) -> np.ndarray:
 	"""Build the radial force curve from current-vs-target RDF error.
-
-	Heck et al. 2013 targetrdf.cc, CalcGradients(): cumulative RDF error divided
-	by N*r^2. The result is a scalar lookup table, not a 2D vector yet:
-	force[k] says how strongly pairs at distance about k*dx should push/pull.
-	compute_targetrdf_gradients() later multiplies this scalar by the actual
-	wrapped pair direction to get a 2D update.
+		Matches C++ code from 2013 heck optimizer
 	"""
 	rdf = np.asarray(rdf, dtype=np.float64)
 	target_rdf = np.asarray(target_rdf, dtype=np.float64)
@@ -207,8 +188,8 @@ def compute_targetrdf_force_curve(rdf: np.ndarray, target_rdf: np.ndarray, n_poi
 		raise ValueError("n_points must be at least 2")
 
 	dx = 0.5 / float(rdf.shape[0])
-	# Integrate the per-bin RDF error from radius 0 outwards. Positive means
-	# "too many pairs up to this radius", negative means "too few".
+	# Integrate the per-bin RDF error from radius 0 outwards. 
+	#  Positive means too many pairs up to this radius, negative means too few.
 	force = np.cumsum(dx * (rdf - target_rdf))
 	# Radius 0 would divide by x^2 below, so keep the zero-distance force finite.
 	force[0] = 0.0
@@ -220,8 +201,7 @@ def compute_targetrdf_force_curve(rdf: np.ndarray, target_rdf: np.ndarray, n_poi
 def compute_targetrdf_energy(rdf: np.ndarray, target_rdf: np.ndarray) -> float:
 	"""Return the L2 distance between two RDF curves over [0, 0.5].
 
-	This is the optimizer's acceptance metric: lower means the measured
-	pair-distance statistics are closer to the target.
+	Lower means the measured pair-distance statistics are closer to the target.
 	"""
 	diff = np.asarray(rdf, dtype=np.float64) - np.asarray(target_rdf, dtype=np.float64)
 	dx = 0.5 / float(diff.shape[0])
@@ -251,12 +231,15 @@ def compute_targetrdf_rdf(points, nbins: int, smoothing: float = 8.0, chunk_size
 		all_indices = torch.arange(n_points, device=points.device)
 		for start in range(0, n_points, chunk_size):
 			end = min(start + chunk_size, n_points)
+			
 			# Pairwise chunk against all points: shape (end - start, n_points).
 			row_indices = torch.arange(start, end, device=points.device)[:, None]
 			delta = points[start:end, None, :] - points[None, :, :]
+			
 			# Wrap each displacement to the nearest toroidal image in [-0.5, 0.5].
 			delta = delta - torch.round(delta)
 			distances = torch.sqrt(torch.sum(delta * delta, dim=2))
+			
 			# Count each unordered pair once, matching targetrdf.cc CalcRDF().
 			mask = (all_indices[None, :] > row_indices) & (distances < 0.5)
 			if torch.any(mask):
@@ -264,8 +247,7 @@ def compute_targetrdf_rdf(points, nbins: int, smoothing: float = 8.0, chunk_size
 				bin_indices = torch.clamp(bin_indices, 0, nbins - 1)
 				counts = counts + torch.bincount(bin_indices, minlength=nbins).to(dtype=torch.float64)
 
-	# Divide pair counts by the expected annulus area and the number of
-	# unordered pairs, so a uniform random set has RDF close to 1.
+	# Divide pair counts by the expected annulus area and the number of unordered pairs, so a uniform random set has RDF close to 1.
 	scale = float(n_points * (n_points - 1)) * 0.5 * math.pi * dx * dx
 	shell_indices = torch.arange(nbins, dtype=torch.float64, device=points.device)
 	rdf = counts / (scale * (2.0 * shell_indices + 1.0))
@@ -273,10 +255,10 @@ def compute_targetrdf_rdf(points, nbins: int, smoothing: float = 8.0, chunk_size
 
 
 def interpolate_curve_torch(curve, x_values, x1: float = 0.5):
-	"""Linearly sample a 1D curve tensor at positions in [0, x1].
+	"""Linearly sample a 1D curve tensor at positions in [0, x1]. 
 
-	`x_values` can be a matrix of pair distances. The returned tensor has the
-	same shape, with each distance replaced by an interpolated curve value.
+	x_values can be a matrix of pair distances. 
+	The returned tensor has the same shape, with each distance replaced by an interpolated curve value.
 	"""
 	size = curve.shape[0]
 	dx = x1 / float(size)
@@ -290,13 +272,12 @@ def interpolate_curve_torch(curve, x_values, x1: float = 0.5):
 def compute_targetrdf_gradients(points, force_curve: np.ndarray, chunk_size: int = 256):
 	"""Compute point updates induced by the radial force curve.
 
-	For each point, sums contributions from all other points within the
-	reliable RDF radius: the force curve supplies a scalar from the pair
-	distance, the wrapped displacement supplies the 2D direction.
+	For each point, sums contributions from all other points within the reliable RDF radius.
+	The force curve supplies a scalar from the pair distance, wrapped displacement supplies the 2D direction.
 
-	Returns (gradients, max_gradient): gradients has shape (n_points, 2);
-	max_gradient is the largest per-point gradient magnitude, used by the
-	caller to normalize the step size.
+	Returns: (gradients, max_gradient): 
+		gradients has shape (n_points, 2);
+		max_gradient is the largest per-point gradient magnitude, used by the caller to normalize the step size.
 	"""
 	if chunk_size < 1:
 		raise ValueError("chunk_size must be positive")
@@ -307,17 +288,19 @@ def compute_targetrdf_gradients(points, force_curve: np.ndarray, chunk_size: int
 	with torch.no_grad():
 		for start in range(0, n_points, chunk_size):
 			end = min(start + chunk_size, n_points)
+			
 			# delta[i, j] is the wrapped vector from chunk point i to point j.
 			delta = points[None, :, :] - points[start:end, None, :]
 			delta = delta + (delta < -0.5).to(dtype=points.dtype) - (delta > 0.5).to(dtype=points.dtype)
 			dist2 = torch.sum(delta * delta, dim=2)
+			
 			# targetrdf ignores distances above 0.49 to avoid toroidal anisotropy.
 			mask = (dist2 > 0.0) & (dist2 <= 0.49 * 0.49)
 			distances = torch.sqrt(torch.clamp(dist2, min=1e-20))
 			pair_force = interpolate_curve_torch(force, distances)
 			pair_force = torch.where(mask, pair_force, torch.zeros_like(pair_force))
-			# pair_force is radial; multiplying by the wrapped pair vector turns
-			# it into a 2D update, summed over neighbours for each point.
+			
+			# pair_force is radial; multiplying by the wrapped pair vector turns it into a 2D update, summed over neighbours for each point.
 			gradients[start:end] = -torch.sum(delta * pair_force[:, :, None], dim=1)
 	max_gradient = torch.sqrt(torch.max(torch.sum(gradients * gradients, dim=1))).item()
 	return (gradients, max_gradient)
@@ -338,8 +321,7 @@ def synthesize_targetrdf_points(
 ) -> SynthesisResult:
 	"""Synthesize points whose RDF follows a solved DS-Wave target.
 
-	This follows the Heck/Schlomer/Deussen TargetRDF force construction, while
-	using a fixed iteration budget instead of stopping at a temperature floor.
+	This follows the Heck TargetRDF force construction, but uses a fixed number of iterations instead of stopping at a temperature floor.
 
 	High-level loop:
 	1. Build the target RDF from the DS-Wave target spectrum.
@@ -364,7 +346,6 @@ def synthesize_targetrdf_points(
 		raise RuntimeError("torch is required for point synthesis")
 
 	torch_device = choose_torch_device(device)
-	# Torch owns the random initial point set, so seed torch rather than NumPy.
 	torch.manual_seed(seed)
 	if torch_device.type == "cuda":
 		torch.cuda.manual_seed_all(seed)
@@ -389,8 +370,7 @@ def synthesize_targetrdf_points(
 	rdf_np = compute_targetrdf_rdf(current, nbins, smoothing=smoothing, chunk_size=chunk_size)
 	energy = compute_targetrdf_energy(rdf_np, target_rdf_np)
 
-	# HSD13 tracks the best RDF match and rolls back unstable moves. Keeping
-	# this state avoids spatial islanding when a step worsens the RDF too much.
+	# HSD13 tracks the best RDF match and rolls back unstable moves. Keeping this state avoids spatial islanding when a step worsens the RDF too much.
 	best = current.clone()
 	best_rdf_np = rdf_np.copy()
 	best_energy = energy
@@ -407,26 +387,26 @@ def synthesize_targetrdf_points(
 			# Scale the largest point displacement to current_step_scale / sqrt(N).
 			step_size = current_step_scale / (math.sqrt(float(n_points)) * max_gradient)
 			current = torch.remainder(current + float(step_size) * gradients, 1.0)
+			
 			# A move changes all pair distances, so the RDF and energy must be
 			# remeasured from the updated point set.
 			rdf_np = compute_targetrdf_rdf(current, nbins, smoothing=smoothing, chunk_size=chunk_size)
 			energy = compute_targetrdf_energy(rdf_np, target_rdf_np)
 			attempts += 1
+			# Accept the improvement and reset the failed-attempt counter.
 			if energy < best_energy:
-				# Accept the improvement and reset the failed-attempt counter.
 				best = current.clone()
 				best_rdf_np = rdf_np.copy()
 				best_energy = energy
 				attempts = 0
+			# Large regression: restore the best set and force step decay.
 			elif energy > best_energy * 1.2:
-				# Large regression: restore the best set and force step decay.
 				current = best.clone()
 				rdf_np = best_rdf_np.copy()
 				energy = best_energy
 				attempts = 5
+			# Match targetrdf's temperature decay idea, but without ending early: keep the iteration budget and make future moves smaller.
 			if attempts >= 5:
-				# Match targetrdf's temperature decay idea, but without ending
-				# early: keep the iteration budget and make future moves smaller.
 				attempts = 0
 				current_step_scale *= 0.9
 		if iteration % log_cadence == 0 or iteration == iterations - 1:
