@@ -1,16 +1,12 @@
-"""DS-Wave target solving (Oztireli 2020, "A Comprehensive Theory and
-Variational Framework for Anti-aliasing Sampling Patterns").
-
+"""
 The solver works with the shifted spectrum F = P - 1 on a frequency grid nu,
-and a discrete Hankel matrix H that maps F to the shifted pair correlation
-f = g - 1 on a distance grid r. The optimization is a linear program: minimize
-total variation of F (Eq. 16) subject to realizability (P >= 0, g >= 0,
-Eq. 12), the clean low band (P <= e0 below nu0, Eq. 14), and the oscillation
-cap (|F| <= m0 - 1 above nu0, Eq. 17 upper bound).
+and a discrete Hankel matrix H that maps F to the shifted pair correlation f = g - 1 on a distance grid r. 
+minimize total variation of F (Eq. 16) subject to realizability (P >= 0, g >= 0, Eq. 12), 
+the clean low band (P <= e0 below nu0, Eq. 14), 
+and the oscillation cap (|F| <= m0 - 1 above nu0, Eq. 17 upper bound).
 
-Units: nu is normalized frequency (|k| / sqrt(N) for integer Fourier modes k of
-an N-point set on the unit torus); r is normalized distance (toroidal distance
-times sqrt(N)).
+nu is normalized frequency (|k| / sqrt(N) for integer Fourier modes k of an N-point set on the unit torus); 
+r is normalized distance (toroidal distance times sqrt(N)).
 """
 from __future__ import annotations
 
@@ -36,20 +32,15 @@ class DsWaveTarget:
 	  e0         float      allowed power below nu0, e.g. 0.0
 	  m0         float      oscillation cap = max P(nu), e.g. 1.765625; None = uncapped
 	  nu         ndarray    frequency axis, e.g. linspace(0.0, 10.0, 1001)
-	  P          ndarray    target radial power spectrum on nu -- the decaying
-	                        square wave: 0.0 below nu0, first plateau at m0,
-	                        alternating plateaus decaying toward 1.0
+	  P          ndarray    target radial power spectrum on nu (the decaying square wave): 0.0 below nu0, first plateau at m0, alternating plateaus decaying toward 1.0
 	  F          ndarray    shifted spectrum, F = P - 1
 	  r          ndarray    distance axis, e.g. linspace(0.0, 4.0, 128)
-	  g          ndarray    target pair correlation on r: g(0) = 0 (exclusion
-	                        zone), first-shell peak ~5.0 near r ~ 1.1, ringing
-	                        toward 1.0
+	  g          ndarray    target pair correlation on r: g(0) = 0 (exclusion zone)
 	  H          ndarray    (n_r, n_nu) Hankel matrix; g = H @ F + 1
 	  low_mask   ndarray    boolean mask of nu samples below nu0 (LP internals)
 	  objective  float      LP objective (total variation of F)
 	  linprog_result        raw scipy.optimize.OptimizeResult
-	  requested_m0  str     CLI bookkeeping only: what the user asked for
-	                        (e.g. "min" or "2.0"), as opposed to the solved m0.
+	  requested_m0  str     debug: requested target m0 rather than solved
 	"""
 	success: bool
 	status: str
@@ -94,8 +85,7 @@ def make_hankel_matrix(nu: np.ndarray, r: np.ndarray) -> np.ndarray:
 	- r: (n_r,), normalized radial distances.
 	- return: (n_r, n_nu), so H @ F evaluates the shifted PCF f(r).
 
-	Entries: H[i, j] = 2*pi * J0(2*pi * r_i * nu_j) * nu_j * w_j, where w_j are
-	trapezoid weights on the nu axis.
+	Entries: H[i, j] = 2*pi * J0(2*pi * r_i * nu_j) * nu_j * w_j, where w_j are trapezoid weights on the nu axis.
 	"""
 	nu_weights = trapezoid_weights(nu) * nu
 	phase = 2.0 * math.pi * np.outer(r, nu)
@@ -124,10 +114,8 @@ def solve_ds_wave_target(
 ) -> DsWaveTarget:
 	"""Solve the DS-Wave target-spectrum linear program for one fixed m0.
 
-	m0=None places no oscillation cap. To solve at the minimal feasible m0,
-	call find_min_m0() first and pass its result here. The function always
-	returns a DsWaveTarget; check .success (an infeasible LP is a normal
-	outcome, e.g. m0=1.0 at nu0=0.85).
+	m0=None places no oscillation cap. To solve at the minimal feasible m0, call find_min_m0() first and pass its result here. 
+	Always returns a DsWaveTarget; check .success (an infeasible LP is fine, e.g. m0=1.0 at nu0=0.85).
 	"""
 	if nu0 < 0.0:
 		raise ValueError("nu0 must be non-negative")
@@ -150,8 +138,7 @@ def solve_ds_wave_target(
 	H = make_hankel_matrix(nu, r)
 	low_mask = nu < nu0
 
-	# LP variable layout: x = [F_0 .. F_{n_nu-1}, tv_0 .. tv_{n_nu-2}].
-	# F is the shifted spectrum; tv stores |F[i+1] - F[i]| for Eq. 16.
+	# LP variable layout: x = [F_0 .. F_{n_nu-1}, tv_0 .. tv_{n_nu-2}]. F is the shifted spectrum; tv stores |F[i+1] - F[i]| for Eq. 16.
 	n_f_values = n_nu
 	n_tv_values = n_nu - 1
 	n_variables = n_f_values + n_tv_values
@@ -265,8 +252,7 @@ def find_min_m0(
 ) -> float | None:
 	"""Find the smallest feasible m0 by bracket expansion plus bisection.
 
-	Returns None when no m0 <= max_m0 is feasible (Section 5.2: m0 = min is
-	found by searching the feasible nu0/e0/m0 region).
+	Returns None when no m0 <= max_m0 is feasible (Section 5.2: m0 = min is found by searching the feasible nu0/e0/m0 region).
 	"""
 	if m0_tol <= 0.0:
 		raise ValueError("m0_tol must be positive")
@@ -308,10 +294,9 @@ def find_min_m0(
 def interpolate_target_power(target: DsWaveTarget, radii: np.ndarray) -> np.ndarray:
 	"""Interpolate the solved target power P(nu) at normalized frequency radii.
 
-	Below nu0 the spec is P <= e0 exactly (Eq. 14), but linear interpolation of
-	the discrete P grid ramps up across the nu0 step (the last sample below nu0
-	is 0, the first above is m0). Radii in that straddle region would read a
-	meaningless ramp value, so the spec bound is re-applied there.
+	Below nu0 the spec is P <= e0 exactly (Eq. 14), but linear interpolation of the discrete P grid ramps up across the nu0 step 
+	(the last sample below nu0 is 0, the first above is m0). 
+	Radii in that straddle region would read a meaningless ramp value, so the spec bound is re-applied there.
 	"""
 	if target.P is None:
 		raise ValueError("target has no solved power spectrum")
@@ -323,15 +308,13 @@ def interpolate_target_power(target: DsWaveTarget, radii: np.ndarray) -> np.ndar
 def evaluate_target_pcf(target: DsWaveTarget, radii: np.ndarray) -> np.ndarray:
 	"""Evaluate g(r) directly from F on arbitrary normalized distance radii.
 
-	This avoids extrapolating the stored target.g samples when synthesis needs
-	distances beyond the solver's r grid: g(r) = 1 + 2*pi * sum_j J0(2*pi r nu_j)
-	* nu_j * F_j * w_j with trapezoid weights w on the nu axis.
+	This avoids extrapolating the stored target.g samples when synthesis needs distances beyond the solver's 
+	r grid: g(r) = 1 + 2*pi * sum_j J0(2*pi r nu_j) * nu_j * F_j * w_j with trapezoid weights w on the nu axis.
 	"""
 	if target.F is None:
 		raise ValueError("target has no solved shifted power spectrum")
 	radii = np.asarray(radii, dtype=np.float64)
 	nu_weights = trapezoid_weights(target.nu) * target.nu * target.F
-	# phase: (len(radii), n_nu). Sum over frequency to get one g(r) per radius.
 	phase = 2.0 * math.pi * np.outer(radii, target.nu)
 	return 1.0 + np.sum(2.0 * math.pi * j0(phase) * nu_weights[None, :], axis=1)
 
