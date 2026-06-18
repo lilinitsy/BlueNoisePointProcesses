@@ -1,13 +1,9 @@
 """DS-Wave command line driver.
 
-Solves DS-Wave target spectra (ds_wave_target.py) for one or more m0 values,
-synthesizes a point set whose RDF matches the chosen target
-(ds_wave_targetrdf.py), and writes diagnostic plots.
-
-This module is also the convenience namespace the notebook imports: the
-re-exports below are the public surface (each is used by ds-wave-testing.ipynb
-or the tests).
+Solves DS-Wave target spectra (ds_wave_target.py) and synthesizes a point set whose RDF matches the chosen target (ds_wave_targetrdf.py).
+This module is also the convenience namespace the notebook imports: the re-exports below are the public surface (each is used by ds-wave-testing.ipynb or the tests).
 """
+
 from __future__ import annotations
 
 import argparse
@@ -60,8 +56,7 @@ from ds_wave_diagnostics import (
 def parse_m0_values(values_text: list[str]) -> list[float | str]:
 	"""Parse CLI m0 arguments: floats plus the literal "min".
 
-	"min" only exists at this CLI boundary; run_cli translates it into an
-	explicit find_min_m0() call before solving.
+	min only exists at this CLI boundary; run_cli translates it into an explicit find_min_m0() call before solving.
 	"""
 	values = []
 	for text in values_text:
@@ -102,8 +97,6 @@ def run_cli(args: argparse.Namespace) -> list[Path]:
 	matplotlib.use("Agg", force=True)
 
 	paths = []
-	# One solved DsWaveTarget per requested m0 (see the DsWaveTarget docstring
-	# for the record contents).
 	solved_targets = []
 	for requested in parse_m0_values(args.m0_values):
 		if requested == "min":
@@ -134,8 +127,6 @@ def run_cli(args: argparse.Namespace) -> list[Path]:
 	if any(solved_target.success for solved_target in solved_targets):
 		paths.append(save_figure(plot_ds_wave_targets(solved_targets), args.output_dir / "targets.png"))
 
-	# Pick the target to synthesize from: prefer the m0="min" solve, otherwise
-	# any feasible solve that actually permits oscillation (m0 != 1).
 	synthesis_target = None
 	for solved_target in solved_targets:
 		if solved_target.success and solved_target.requested_m0 == "min":
