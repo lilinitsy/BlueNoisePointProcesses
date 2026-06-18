@@ -14,7 +14,7 @@ def make_centered_integer_axis(k_max: int, grid_size: int) -> np.ndarray:
 	grid_size = max(int(grid_size), 1)
 	full_size = 2 * k_max + 1
 	if grid_size >= full_size:
-		return np.arange(-k_max, k_max + 1, dtype=np.float64)
+		return np.arange(-k_max, k_max + 1, dtype=np.float32)
 
 	negative_count = grid_size // 2
 	positive_count = grid_size - negative_count - 1
@@ -25,11 +25,11 @@ def make_centered_integer_axis(k_max: int, grid_size: int) -> np.ndarray:
 		axis = np.unique(axis)
 		if 0 not in axis:
 			axis = np.sort(np.concatenate([axis, np.array([0], dtype=np.int32)]))
-	return axis.astype(np.float64)
+	return axis.astype(np.float32)
 
 def compute_periodogram_2d(points: np.ndarray, grid_size: int = 96, max_freq: float = 3.0) -> tuple[np.ndarray, tuple[float, float, float, float]]:
 	# Equation 2 diagnostic on integer Fourier modes, displayed as k / sqrt(N).
-	points = np.asarray(points, dtype=np.float64)
+	points = np.asarray(points, dtype=np.float32)
 	n_points = points.shape[0]
 	if n_points == 0:
 		raise ValueError("points must not be empty")
@@ -58,11 +58,11 @@ def bin_radial_values(
 	by ds_wave_psd_eval.binned_target_power (target powers), so the two sides of
 	the fit metric always see identical bin definitions.
 	"""
-	radii = np.asarray(radii, dtype=np.float64)
-	values = np.asarray(values, dtype=np.float64)
+	radii = np.asarray(radii, dtype=np.float32)
+	values = np.asarray(values, dtype=np.float32)
 	edges = np.linspace(0.0, max_freq, num_bins + 1)
 	centres = 0.5 * (edges[:-1] + edges[1:])
-	binned = np.full(num_bins, np.nan, dtype=np.float64)
+	binned = np.full(num_bins, np.nan, dtype=np.float32)
 	for index in range(num_bins):
 		mask = (radii >= edges[index]) & (radii < edges[index + 1])
 		if np.any(mask):
@@ -82,7 +82,7 @@ def compute_radial_psd(
 	priority_nu: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
 	# Paper evaluation averages Equation 2 powers radially for 1D spectra.
-	points = np.asarray(points, dtype=np.float64)
+	points = np.asarray(points, dtype=np.float32)
 	modes = make_frequency_modes(points.shape[0], nu_max=max_freq, mode_limit=mode_limit, seed=0, priority_nu=priority_nu)
 	radii = np.linalg.norm(modes, axis=1) / math.sqrt(float(points.shape[0]))
 	powers = direct_mode_power(points, modes)
@@ -99,7 +99,7 @@ def compute_low_frequency_mode_powers(
 	This diagnostic checks whether the low-frequency hole is genuinely leaking,
 	instead of relying on a downsampled periodogram image.
 	"""
-	points = np.asarray(points, dtype=np.float64)
+	points = np.asarray(points, dtype=np.float32)
 	if points.ndim != 2 or points.shape[0] < 1:
 		raise ValueError("points must have shape (n_points, n_dims) with at least one point")
 	if nu_max <= 0.0:
@@ -164,8 +164,8 @@ def compute_target_mode_powers(
 
 def summarise_mode_power_bands(report: dict, bands: list[tuple[float, float]]) -> list[dict]:
 	"""Summarise mode-power diagnostics over radial frequency bands."""
-	radii = np.asarray(report["radii"], dtype=np.float64)
-	powers = np.asarray(report["powers"], dtype=np.float64)
+	radii = np.asarray(report["radii"], dtype=np.float32)
+	powers = np.asarray(report["powers"], dtype=np.float32)
 	if radii.shape != powers.shape:
 		raise ValueError("report radii and powers must have the same shape")
 
@@ -193,7 +193,7 @@ def summarise_mode_power_bands(report: dict, bands: list[tuple[float, float]]) -
 
 def compute_empirical_pcf(points: np.ndarray, num_bins: int = 80, r_max: float = 4.0) -> tuple[np.ndarray, np.ndarray]:
 	# Equation 1 diagnostic: normalized pair-distance histogram in toroidal coordinates.
-	points = np.asarray(points, dtype=np.float64)
+	points = np.asarray(points, dtype=np.float32)
 	n_points = points.shape[0]
 	if n_points < 2:
 		centres = np.linspace(0.0, r_max, num_bins, endpoint=False)
@@ -264,7 +264,7 @@ def plot_periodogram(power: np.ndarray, extent: tuple[float, float, float, float
 	import matplotlib.pyplot as plt
 
 	# Paper figures show empirical 2D power spectra from Equation 2.
-	display_power = np.array(power, dtype=np.float64, copy=True)
+	display_power = np.array(power, dtype=np.float32, copy=True)
 	center_y = display_power.shape[0] // 2
 	center_x = display_power.shape[1] // 2
 	display_power[center_y, center_x] = 0.0

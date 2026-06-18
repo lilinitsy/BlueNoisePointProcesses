@@ -125,17 +125,17 @@ def smooth_curve_gaussian(values: np.ndarray, sigma: float) -> np.ndarray:
 	sigma is a number of histogram bins (e.g. sigma=8 averages each bin with its neighbours on an 8-bin Gaussian scale).
 	The window is hard-truncated at 5 sigma and the weights are renormalized at the array edges, matching Heck's FilterGauss boundary handling.
 	"""
-	values = np.asarray(values, dtype=np.float64)
+	values = np.asarray(values, dtype=np.float32)
 	if sigma <= 0.0:
 		return values.copy()
 
 	radius = int(math.ceil(5.0 * sigma))
-	offsets = np.arange(-radius, radius + 1, dtype=np.float64)
+	offsets = np.arange(-radius, radius + 1, dtype=np.float32)
 	kernel = np.exp(-(offsets * offsets) / (2.0 * sigma * sigma))
 
 	if values.shape[0] <= 2 * radius:
 		# Window wider than the curve: compute the (small) dense weight matrix.
-		positions = np.arange(values.shape[0], dtype=np.float64)
+		positions = np.arange(values.shape[0], dtype=np.float32)
 		weights = np.exp(-((positions[:, None] - positions[None, :]) ** 2) / (2.0 * sigma * sigma))
 		weights[np.abs(positions[:, None] - positions[None, :]) > radius] = 0.0
 		return (weights @ values) / np.sum(weights, axis=1)
@@ -167,7 +167,7 @@ def make_targetrdf_target_curve(
 	"""
 	# Heck et al. targetrdf works in unit-square distances x in [0, 0.5].
 	dx = 0.5 / float(nbins)
-	unit_r = np.arange(nbins, dtype=np.float64) * dx
+	unit_r = np.arange(nbins, dtype=np.float32) * dx
 	normalised_r = unit_r * math.sqrt(float(n_points))
 	target_pcf = np.maximum(evaluate_target_pcf(target, normalised_r), 0.0)
 	target_rdf = smooth_curve_gaussian(target_pcf, smoothing)
@@ -178,8 +178,8 @@ def compute_targetrdf_force_curve(rdf: np.ndarray, target_rdf: np.ndarray, n_poi
 	"""Build the radial force curve from current-vs-target RDF error.
 		Matches C++ code from 2013 heck optimizer
 	"""
-	rdf = np.asarray(rdf, dtype=np.float64)
-	target_rdf = np.asarray(target_rdf, dtype=np.float64)
+	rdf = np.asarray(rdf, dtype=np.float32)
+	target_rdf = np.asarray(target_rdf, dtype=np.float32)
 	if rdf.shape != target_rdf.shape:
 		raise ValueError("rdf and target_rdf must have the same shape")
 	if rdf.ndim != 1 or rdf.shape[0] < 2:
@@ -193,7 +193,7 @@ def compute_targetrdf_force_curve(rdf: np.ndarray, target_rdf: np.ndarray, n_poi
 	force = np.cumsum(dx * (rdf - target_rdf))
 	# Radius 0 would divide by x^2 below, so keep the zero-distance force finite.
 	force[0] = 0.0
-	x = np.arange(1, force.shape[0], dtype=np.float64) * dx
+	x = np.arange(1, force.shape[0], dtype=np.float32) * dx
 	force[1:] /= float(n_points) * x * x
 	return force
 
@@ -203,7 +203,7 @@ def compute_targetrdf_energy(rdf: np.ndarray, target_rdf: np.ndarray) -> float:
 
 	Lower means the measured pair-distance statistics are closer to the target.
 	"""
-	diff = np.asarray(rdf, dtype=np.float64) - np.asarray(target_rdf, dtype=np.float64)
+	diff = np.asarray(rdf, dtype=np.float32) - np.asarray(target_rdf, dtype=np.float32)
 	dx = 0.5 / float(diff.shape[0])
 	return float(math.sqrt(dx * np.sum(diff * diff)))
 
@@ -417,7 +417,7 @@ def synthesize_targetrdf_points(
 
 	return SynthesisResult(
 		points=best.detach().cpu().numpy(),
-		energy_history=np.array(energy_history, dtype=np.float64),
+		energy_history=np.array(energy_history, dtype=np.float32),
 		r_values=unit_r_np * math.sqrt(float(n_points)),
 		target_pcf=target_pcf_np,
 		target_rdf=target_rdf_np,

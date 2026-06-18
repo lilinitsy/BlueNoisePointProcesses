@@ -69,7 +69,7 @@ def trapezoid_weights(axis: np.ndarray) -> np.ndarray:
 	if np.any(widths <= 0.0):
 		raise ValueError("axis samples must be strictly increasing")
 
-	weights = np.empty_like(axis, dtype=np.float64)
+	weights = np.empty_like(axis, dtype=np.float32)
 	weights[0] = 0.5 * widths[0]
 	weights[-1] = 0.5 * widths[-1]
 	if axis.shape[0] > 2:
@@ -133,8 +133,8 @@ def solve_ds_wave_target(
 		raise ValueError("m0 must be at least 1.0, or None for no cap")
 
 	# Discretization grids (Section 5.4). nu: (n_nu,), r: (n_r,), H: (n_r, n_nu).
-	nu = np.linspace(0.0, nu_max, n_nu, dtype=np.float64)
-	r = np.linspace(0.0, r_max, n_r, dtype=np.float64)
+	nu = np.linspace(0.0, nu_max, n_nu, dtype=np.float32)
+	r = np.linspace(0.0, r_max, n_r, dtype=np.float32)
 	H = make_hankel_matrix(nu, r)
 	low_mask = nu < nu0
 
@@ -144,7 +144,7 @@ def solve_ds_wave_target(
 	n_variables = n_f_values + n_tv_values
 
 	# Objective (Eq. 16): minimize the total variation, sum of the tv variables.
-	c = np.zeros(n_variables, dtype=np.float64)
+	c = np.zeros(n_variables, dtype=np.float32)
 	c[n_f_values:] = 1.0
 
 	bounds = []
@@ -172,21 +172,21 @@ def solve_ds_wave_target(
 
 	# Eq. 12: g = H @ F + 1 >= 0, i.e. -H @ F <= 1 (one row per r sample).
 	for row in -H:
-		full_row = np.zeros(n_variables, dtype=np.float64)
+		full_row = np.zeros(n_variables, dtype=np.float32)
 		full_row[:n_f_values] = row
 		a_rows.append(full_row)
 		b_values.append(1.0)
 
 	# Eq. 16 linearization: tv_i >= F_{i+1} - F_i and tv_i >= -(F_{i+1} - F_i).
 	for index in range(n_tv_values):
-		row = np.zeros(n_variables, dtype=np.float64)
+		row = np.zeros(n_variables, dtype=np.float32)
 		row[index + 1] = 1.0
 		row[index] = -1.0
 		row[n_f_values + index] = -1.0
 		a_rows.append(row)
 		b_values.append(0.0)
 
-		row = np.zeros(n_variables, dtype=np.float64)
+		row = np.zeros(n_variables, dtype=np.float32)
 		row[index + 1] = -1.0
 		row[index] = 1.0
 		row[n_f_values + index] = -1.0
@@ -194,7 +194,7 @@ def solve_ds_wave_target(
 		b_values.append(0.0)
 
 	A_ub = np.vstack(a_rows)
-	b_ub = np.array(b_values, dtype=np.float64)
+	b_ub = np.array(b_values, dtype=np.float32)
 
 	result = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method="highs")
 	if not result.success:
@@ -300,7 +300,7 @@ def interpolate_target_power(target: DsWaveTarget, radii: np.ndarray) -> np.ndar
 	"""
 	if target.P is None:
 		raise ValueError("target has no solved power spectrum")
-	radii = np.asarray(radii, dtype=np.float64)
+	radii = np.asarray(radii, dtype=np.float32)
 	powers = np.interp(radii, target.nu, target.P, left=target.P[0], right=target.P[-1])
 	return np.where(radii < target.nu0, np.minimum(powers, target.e0), powers)
 
@@ -313,7 +313,7 @@ def evaluate_target_pcf(target: DsWaveTarget, radii: np.ndarray) -> np.ndarray:
 	"""
 	if target.F is None:
 		raise ValueError("target has no solved shifted power spectrum")
-	radii = np.asarray(radii, dtype=np.float64)
+	radii = np.asarray(radii, dtype=np.float32)
 	nu_weights = trapezoid_weights(target.nu) * target.nu * target.F
 	phase = 2.0 * math.pi * np.outer(radii, target.nu)
 	return 1.0 + np.sum(2.0 * math.pi * j0(phase) * nu_weights[None, :], axis=1)

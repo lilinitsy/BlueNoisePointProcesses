@@ -134,8 +134,8 @@ def find_target_discontinuities(target: dict, min_jump: float = 0.2) -> np.ndarr
 	"""
 	if target.P is None:
 		raise ValueError("target has no solved power spectrum")
-	nu = np.asarray(target.nu, dtype=np.float64)
-	P = np.asarray(target.P, dtype=np.float64)
+	nu = np.asarray(target.nu, dtype=np.float32)
+	P = np.asarray(target.P, dtype=np.float32)
 	diffs = np.abs(np.diff(P))
 	jump_indices = np.where(diffs > min_jump)[0]
 	# Report the nu mid-point of each jumping pair.
@@ -187,9 +187,9 @@ def psd_fit_metrics(
 	if target_power is None:
 		target_power = interpolate_target_power(target, freqs)
 	else:
-		target_power = np.asarray(target_power, dtype=np.float64)
-	freqs = np.asarray(freqs, dtype=np.float64)
-	psd = np.asarray(psd, dtype=np.float64)
+		target_power = np.asarray(target_power, dtype=np.float32)
+	freqs = np.asarray(freqs, dtype=np.float32)
+	psd = np.asarray(psd, dtype=np.float32)
 	residual = psd - target_power
 	nu0 = float(target.nu0)
 	low_band = freqs < 0.8 * nu0
