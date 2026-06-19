@@ -2,12 +2,14 @@ from __future__ import annotations
 
 """Exploratory 3D DS-Wave target-spectrum solver.
 
-It solves and visualizes the 3D analogue of the DS-Wave target curves:
+This module intentionally does not synthesize 3D point sets. It only solves and
+visualizes the 3D analogue of the DS-Wave target curves:
 
 	P(nu) = F(nu) + 1
 	g(r) = 1 + 4 pi integral F(nu) sinc(2 pi r nu) nu^2 dnu
 
-This should match the 2D target structure, but the realizability transform uses the 3D radial Fourier kernel instead of the 2D J0 kernel.
+The LP structure matches the 2D target solver, but the realizability transform
+uses the 3D radial Fourier kernel instead of the 2D J0 kernel.
 """
 
 import math
@@ -37,10 +39,47 @@ from ds_wave_targetrdf import (
 from ds_wave_spectrum import direct_mode_power
 
 
+# Default RDF bin count for 3D, decoupled from the point count. Mirrors the 2D
+# RC-1 fix (ds_wave_targetrdf.DEFAULT_TARGETRDF_NBINS): the 3D module previously
+# tied nbins = N, which under-resolves the sharp first shell of g(r) when N is
+# small. A fixed grid resolves it regardless of point count.
+DEFAULT_TARGETRDF_NBINS_3D = 4096
+
+# Fixed smoothing in normalized DS-Wave distance (same value as the 2D
+# DEFAULT_TARGETRDF_SIGMA_RNORM), converted to bins with the 3D N^(1/3)
+# normalizer rather than the 2D sqrt(N).
+DEFAULT_TARGETRDF_SIGMA_RNORM_3D = 0.04
+
+
+def resolve_targetrdf_resolution_3d(
+	n_points: int,
+	nbins: int | None,
+	smoothing: float | None,
+) -> tuple[int, float]:
+	"""Resolve the effective (nbins, smoothing) for 3D PCF matching.
+
+	Mirrors ds_wave_targetrdf.resolve_targetrdf_resolution but with the 3D
+	N^(1/3) normalizer. When nbins is None, use a fixed grid decoupled from N
+	(floored at DEFAULT_TARGETRDF_NBINS_3D) large enough to resolve the first RDF
+	shell. When smoothing is None, choose the bin sigma holding a fixed
+	normalized-distance sigma (DEFAULT_TARGETRDF_SIGMA_RNORM_3D):
+	sigma_rnorm = sigma_bins * (0.5/nbins) * N^(1/3), so
+	sigma_bins = sigma_rnorm * nbins / (0.5 * N^(1/3)).
+	"""
+	if n_points < 2:
+		raise ValueError("n_points must be at least 2 for 3D PCF matching")
+	effective_nbins = int(max(DEFAULT_TARGETRDF_NBINS_3D, n_points) if nbins is None else nbins)
+	if smoothing is None:
+		effective_smoothing = DEFAULT_TARGETRDF_SIGMA_RNORM_3D * effective_nbins / (0.5 * float(n_points) ** (1.0 / 3.0))
+	else:
+		effective_smoothing = float(smoothing)
+	return (effective_nbins, effective_smoothing)
+
+
 def sinc(x: np.ndarray | float) -> np.ndarray:
 	"""Return sin(x) / x with sinc(0) = 1.
 
-	NumPy's np.sinc uses sin(pi x) / (pi x)
+	NumPy's np.sinc uses sin(pi x) / (pi x), so we keep this explicit.
 	"""
 	x = np.asarray(x, dtype=np.float64)
 	result = np.ones_like(x, dtype=np.float64)
@@ -365,7 +404,9 @@ def make_targetrdf_target_curve_3d(target: dict, n_points: int, nbins: int, smoo
 def compute_targetrdf_force_curve_3d(rdf: np.ndarray, target_rdf: np.ndarray, n_points: int) -> np.ndarray:
 	"""Build a 3D radial force lookup curve from RDF error.
 
-	This mirrors the 2D TargetRDF force construction, but the radial volume scaling changes from r^2 to r^3. The returned scalar curve is later multiplied by wrapped 3D pair directions.
+	This mirrors the 2D TargetRDF force construction, but the radial volume
+	scaling changes from r^2 to r^3. The returned scalar curve is later
+	multiplied by wrapped 3D pair directions.
 	"""
 	rdf = np.asarray(rdf, dtype=np.float64)
 	target_rdf = np.asarray(target_rdf, dtype=np.float64)
@@ -461,7 +502,7 @@ def synthesize_targetrdf_points_3d(
 	device: str | None = "auto",
 	step_scale: float = 1.0,
 	nbins: int | None = None,
-	smoothing: float = 8.0,
+	smoothing: float | None = None,
 	chunk_size: int = 256,
 	initial_points: np.ndarray | None = None,
 	log_every: int | None = None,
@@ -473,7 +514,7 @@ def synthesize_targetrdf_points_3d(
 		raise ValueError("iterations must be non-negative")
 	if nbins is not None and nbins < 2:
 		raise ValueError("nbins must be at least 2")
-	if smoothing < 0.0:
+	if smoothing is not None and smoothing < 0.0:
 		raise ValueError("smoothing must be non-negative")
 	if step_scale <= 0.0:
 		raise ValueError("step_scale must be positive")
@@ -487,7 +528,7 @@ def synthesize_targetrdf_points_3d(
 	if torch_device.type == "cuda":
 		torch.cuda.manual_seed_all(seed)
 
-	nbins = int(n_points if nbins is None else nbins)
+	(nbins, smoothing) = resolve_targetrdf_resolution_3d(n_points, nbins, smoothing)
 	torch_dtype = torch.float32
 	if initial_points is None:
 		current = torch.rand((n_points, 3), dtype=torch_dtype, device=torch_device)
@@ -564,7 +605,7 @@ def synthesize_toroidal_points_3d(
 	device: str | None = "auto",
 	step_scale: float = 1.0,
 	nbins: int | None = None,
-	smoothing: float = 8.0,
+	smoothing: float | None = None,
 	chunk_size: int = 256,
 	initial_points: np.ndarray | None = None,
 	log_every: int | None = None,
@@ -637,7 +678,7 @@ def compute_radial_psd_3d(
 	points: np.ndarray,
 	num_bins: int = 80,
 	max_freq: float = 3.0,
-	mode_limit: int = 8192,
+	mode_limit: int = 100000,
 	priority_nu: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
 	"""Average Equation 2 Fourier powers over 3D radial frequency shells."""
@@ -674,7 +715,7 @@ def plot_radial_psd_overlay_3d(
 	target: DsWaveTarget,
 	num_bins: int = 80,
 	max_freq: float = 3.0,
-	mode_limit: int = 8192,
+	mode_limit: int = 100000,
 ):
 	"""Plot empirical 3D radial PSD against the optimized 3D target spectrum."""
 	import matplotlib.pyplot as plt

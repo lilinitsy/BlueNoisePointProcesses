@@ -56,6 +56,22 @@ def test_evaluate_pcf_3d_matches_solver_grid():
 	assert np.allclose(g_eval, target.g, atol=1e-5)
 
 
+def test_resolution_3d_decouples_nbins_and_calibrates_smoothing():
+	# nbins=None resolves to max(4096, n_points), decoupled from N (the RC-1 fix).
+	# At N=1024 the old coupling gave 1024; now it is floored at 4096.
+	(nbins, smoothing) = d3.resolve_targetrdf_resolution_3d(1024, None, None)
+	assert nbins == 4096
+	# smoothing=None holds a fixed normalized sigma (sigma_rnorm=0.04) via N^(1/3):
+	# sigma_rnorm = sigma_bins * (0.5/nbins) * N^(1/3).
+	sigma_rnorm = smoothing * (0.5 / nbins) * 1024 ** (1.0 / 3.0)
+	assert abs(sigma_rnorm - d3.DEFAULT_TARGETRDF_SIGMA_RNORM_3D) < 1e-6
+	# Above the floor, nbins follows n_points.
+	(nbins_big, _) = d3.resolve_targetrdf_resolution_3d(8000, None, None)
+	assert nbins_big == 8000
+	# Explicit values pass through unchanged.
+	assert d3.resolve_targetrdf_resolution_3d(1024, 256, 3.0) == (256, 3.0)
+
+
 def test_3d_synthesis_smoke_returns_dataclass():
 	if d3.torch is None:
 		print("SKIP test_3d_synthesis_smoke_returns_dataclass: torch unavailable")
