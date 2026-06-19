@@ -2,14 +2,12 @@ from __future__ import annotations
 
 """Exploratory 3D DS-Wave target-spectrum solver.
 
-This module intentionally does not synthesize 3D point sets. It only solves and
-visualizes the 3D analogue of the DS-Wave target curves:
+It solves and visualizes the 3D analogue of the DS-Wave target curves:
 
 	P(nu) = F(nu) + 1
 	g(r) = 1 + 4 pi integral F(nu) sinc(2 pi r nu) nu^2 dnu
 
-The LP structure matches the 2D target solver, but the realizability transform
-uses the 3D radial Fourier kernel instead of the 2D J0 kernel.
+This should match the 2D target structure, but the realizability transform uses the 3D radial Fourier kernel instead of the 2D J0 kernel.
 """
 
 import math
@@ -28,12 +26,13 @@ python_dir = Path(__file__).resolve().parent
 if str(python_dir) not in sys.path:
 	sys.path.insert(0, str(python_dir))
 
-from ds_wave_target import empty_target, linprog_status_name, trapezoid_weights
+from ds_wave_target import DsWaveTarget, linprog_status_name, trapezoid_weights
 from ds_wave_targetrdf import (
 	choose_torch_device,
 	compute_targetrdf_energy,
 	interpolate_curve_torch,
 	smooth_curve_gaussian,
+	SynthesisResult,
 )
 from ds_wave_spectrum import direct_mode_power
 
@@ -41,7 +40,7 @@ from ds_wave_spectrum import direct_mode_power
 def sinc(x: np.ndarray | float) -> np.ndarray:
 	"""Return sin(x) / x with sinc(0) = 1.
 
-	NumPy's np.sinc uses sin(pi x) / (pi x), so we keep this explicit.
+	NumPy's np.sinc uses sin(pi x) / (pi x)
 	"""
 	x = np.asarray(x, dtype=np.float64)
 	result = np.ones_like(x, dtype=np.float64)
@@ -72,7 +71,7 @@ def solve_ds_wave_target_3d(
 	m0_tol: float = 0.02,
 	max_m0: float = 64.0,
 	require_success: bool = True,
-) -> dict:
+) -> DsWaveTarget:
 	"""Solve the 3D DS-Wave target-spectrum LP.
 
 	The only mathematical difference from the 2D target solve is the transform
@@ -95,10 +94,26 @@ def solve_ds_wave_target_3d(
 			r = np.linspace(0.0, r_max, n_r, dtype=np.float64)
 			H = make_hankel_matrix_3d(nu, r)
 			low_mask = nu < nu0
-			target = empty_target("infeasible", "No feasible finite m0 found.", nu, r, H, low_mask, m0, nu0=nu0, e0=e0)
-			target["dimension"] = 3
+			target = DsWaveTarget(
+				success=False,
+				status="infeasible",
+				message="No feasible finite m0 found.",
+				nu0=nu0,
+				e0=e0,
+				m0=m0,
+				nu=nu,
+				r=r,
+				H=H,
+				low_mask=low_mask,
+				F=None,
+				P=None,
+				g=None,
+				objective=None,
+				linprog_result=None,
+				dimension=3,
+			)
 			if require_success:
-				raise RuntimeError(target["message"])
+				raise RuntimeError(target.message)
 			return target
 		return solve_ds_wave_target_3d(
 			nu0=nu0,
@@ -189,8 +204,24 @@ def solve_ds_wave_target_3d(
 	result = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method="highs")
 	status = linprog_status_name(result.status)
 	if not result.success:
-		target = empty_target(status, result.message, nu, r, H, low_mask, m0, nu0=nu0, e0=e0, result=result)
-		target["dimension"] = 3
+		target = DsWaveTarget(
+			success=False,
+			status=status,
+			message=result.message,
+			nu0=nu0,
+			e0=e0,
+			m0=m0,
+			nu=nu,
+			r=r,
+			H=H,
+			low_mask=low_mask,
+			F=None,
+			P=None,
+			g=None,
+			objective=None,
+			linprog_result=result,
+			dimension=3,
+		)
 		if require_success:
 			raise RuntimeError(f"3D DS-Wave target solve {status}: {result.message}")
 		return target
@@ -198,24 +229,24 @@ def solve_ds_wave_target_3d(
 	F = result.x[:n_f_values]
 	P = F + 1.0
 	g = H @ F + 1.0
-	return {
-		"success": True,
-		"status": "optimal",
-		"message": result.message,
-		"dimension": 3,
-		"nu0": nu0,
-		"e0": e0,
-		"nu": nu,
-		"r": r,
-		"H": H,
-		"low_mask": low_mask,
-		"m0": m0,
-		"F": F,
-		"P": P,
-		"g": g,
-		"objective": float(result.fun),
-		"linprog_result": result,
-	}
+	return DsWaveTarget(
+		success=True,
+		status="optimal",
+		message=result.message,
+		nu0=nu0,
+		e0=e0,
+		m0=m0,
+		nu=nu,
+		r=r,
+		H=H,
+		low_mask=low_mask,
+		F=F,
+		P=P,
+		g=g,
+		objective=float(result.fun),
+		linprog_result=result,
+		dimension=3,
+	)
 
 def find_min_m0_3d(
 	nu0: float = 0.85,
@@ -244,7 +275,7 @@ def find_min_m0_3d(
 		tail_anchor_count=tail_anchor_count,
 		require_success=False,
 	)
-	if lower_target["success"]:
+	if lower_target.success:
 		return lower
 
 	upper = 2.0
@@ -259,7 +290,7 @@ def find_min_m0_3d(
 		tail_anchor_count=tail_anchor_count,
 		require_success=False,
 	)
-	while not upper_target["success"] and upper < max_m0:
+	while not upper_target.success and upper < max_m0:
 		lower = upper
 		upper = min(upper * 2.0, max_m0)
 		upper_target = solve_ds_wave_target_3d(
@@ -274,7 +305,7 @@ def find_min_m0_3d(
 			require_success=False,
 		)
 
-	if not upper_target["success"]:
+	if not upper_target.success:
 		return None
 
 	while upper - lower > m0_tol:
@@ -290,19 +321,19 @@ def find_min_m0_3d(
 			tail_anchor_count=tail_anchor_count,
 			require_success=False,
 		)
-		if target["success"]:
+		if target.success:
 			upper = mid
 		else:
 			lower = mid
 	return upper
 
-def evaluate_target_pcf_3d(target: dict, radii: np.ndarray) -> np.ndarray:
+def evaluate_target_pcf_3d(target: DsWaveTarget, radii: np.ndarray) -> np.ndarray:
 	"""Evaluate the 3D target PCF g(r) directly from F at arbitrary radii."""
-	if target["F"] is None:
+	if target.F is None:
 		raise ValueError("target has no solved shifted power spectrum")
 	radii = np.asarray(radii, dtype=np.float64)
-	nu = np.asarray(target["nu"], dtype=np.float64)
-	F = np.asarray(target["F"], dtype=np.float64)
+	nu = np.asarray(target.nu, dtype=np.float64)
+	F = np.asarray(target.F, dtype=np.float64)
 	nu_weights = trapezoid_weights(nu) * nu * nu * F
 	phase = 2.0 * math.pi * np.outer(radii, nu)
 	return 1.0 + np.sum(4.0 * math.pi * sinc(phase) * nu_weights[None, :], axis=1)
@@ -334,9 +365,7 @@ def make_targetrdf_target_curve_3d(target: dict, n_points: int, nbins: int, smoo
 def compute_targetrdf_force_curve_3d(rdf: np.ndarray, target_rdf: np.ndarray, n_points: int) -> np.ndarray:
 	"""Build a 3D radial force lookup curve from RDF error.
 
-	This mirrors the 2D TargetRDF force construction, but the radial volume
-	scaling changes from r^2 to r^3. The returned scalar curve is later
-	multiplied by wrapped 3D pair directions.
+	This mirrors the 2D TargetRDF force construction, but the radial volume scaling changes from r^2 to r^3. The returned scalar curve is later multiplied by wrapped 3D pair directions.
 	"""
 	rdf = np.asarray(rdf, dtype=np.float64)
 	target_rdf = np.asarray(target_rdf, dtype=np.float64)
@@ -436,7 +465,7 @@ def synthesize_targetrdf_points_3d(
 	chunk_size: int = 256,
 	initial_points: np.ndarray | None = None,
 	log_every: int | None = None,
-) -> dict:
+) -> SynthesisResult:
 	"""Synthesize periodic unit-cube points whose RDF follows a 3D DS-Wave target."""
 	if n_points < 2:
 		raise ValueError("n_points must be at least 2 for 3D PCF matching")
@@ -513,22 +542,19 @@ def synthesize_targetrdf_points_3d(
 	if iterations == 0:
 		energy_history.append(best_energy)
 
-	return {
-		"points": best.detach().cpu().numpy(),
-		"energy_history": np.array(energy_history, dtype=np.float64),
-		"r_values": unit_r_np * float(n_points) ** (1.0 / 3.0),
-		"target_pcf": target_pcf_np,
-		"target_rdf": target_rdf_np,
-		"final_rdf": best_rdf_np,
-		"iterations_run": iterations_run,
-		"synthesis_mode": "pcf_matching_3d",
-		"pcf_algorithm": "targetrdf_force_3d",
-		"pcf_num_bins": nbins,
-		"pcf_smoothing": smoothing,
-		"pcf_step_scale": step_scale,
-		"pcf_final_step_scale": current_step_scale,
-		"device": str(torch_device),
-	}
+	return SynthesisResult(
+		points=best.detach().cpu().numpy(),
+		energy_history=np.array(energy_history, dtype=np.float32),
+		r_values=unit_r_np * float(n_points) ** (1.0 / 3.0),
+		target_pcf=target_pcf_np,
+		target_rdf=target_rdf_np,
+		final_rdf=best_rdf_np,
+		iterations_run=iterations_run,
+		nbins=nbins,
+		smoothing=smoothing,
+		final_step_scale=current_step_scale,
+		device=str(torch_device),
+	)
 
 def synthesize_toroidal_points_3d(
 	target: dict,
@@ -542,7 +568,7 @@ def synthesize_toroidal_points_3d(
 	chunk_size: int = 256,
 	initial_points: np.ndarray | None = None,
 	log_every: int | None = None,
-) -> dict:
+) -> SynthesisResult:
 	"""Convenience wrapper for 3D DS-Wave PCF/TargetRDF point synthesis."""
 	return synthesize_targetrdf_points_3d(
 		target,
@@ -645,7 +671,7 @@ def compute_radial_psd_3d(
 
 def plot_radial_psd_overlay_3d(
 	points: np.ndarray,
-	target: dict,
+	target: DsWaveTarget,
 	num_bins: int = 80,
 	max_freq: float = 3.0,
 	mode_limit: int = 8192,
@@ -658,9 +684,9 @@ def plot_radial_psd_overlay_3d(
 		num_bins=num_bins,
 		max_freq=max_freq,
 		mode_limit=mode_limit,
-		priority_nu=target.get("nu0"),
+		priority_nu=target.nu0,
 	)
-	target_power = np.interp(freqs, target["nu"], target["P"], left=target["P"][0], right=target["P"][-1])
+	target_power = np.interp(freqs, target.nu, target.P, left=target.P[0], right=target.P[-1])
 	fig, ax = plt.subplots(figsize=(7.0, 4.2), dpi=120)
 	ax.plot(freqs, radial, label="empirical", color="#174a7c", linewidth=2.0)
 	ax.plot(freqs, target_power, label="target", color="#9a3412", linewidth=2.0)
@@ -673,19 +699,19 @@ def plot_radial_psd_overlay_3d(
 	ax.legend()
 	return fig
 
-def plot_3d_target(target: dict):
+def plot_3d_target(target: DsWaveTarget):
 	"""Plot the optimized 3D radial power spectrum and implied PCF."""
 	import matplotlib.pyplot as plt
 
 	fig, axes = plt.subplots(1, 2, figsize=(12, 4), dpi=120)
-	axes[0].plot(target["nu"], target["P"], label="3D target")
+	axes[0].plot(target.nu, target.P, label="3D target")
 	axes[0].axhline(1.0, color="0.55", linestyle="--", linewidth=1)
 	axes[0].set_xlabel("normalised radial frequency")
 	axes[0].set_ylabel("P(nu)")
 	axes[0].set_title("3D DS-Wave Target Spectrum")
 	axes[0].legend()
 
-	axes[1].plot(target["r"], target["g"], label="3D target")
+	axes[1].plot(target.r, target.g, label="3D target")
 	axes[1].axhline(1.0, color="0.55", linestyle="--", linewidth=1)
 	axes[1].axhline(0.0, color="0.55", linestyle=":", linewidth=1)
 	axes[1].set_xlabel("normalised radial distance")

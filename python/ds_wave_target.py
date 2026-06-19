@@ -58,6 +58,7 @@ class DsWaveTarget:
 	objective: float | None
 	linprog_result: object
 	requested_m0: str = ""
+	dimension: int = 2
 
 
 def trapezoid_weights(axis: np.ndarray) -> np.ndarray:
